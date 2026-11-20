@@ -1,0 +1,8 @@
+{
+  "name": "Foxy RedFox Indy Command",
+  "description": "EVE Online Industry, Logistics, and Market Intelligence command console for Jita, Dodixie, and Ishisomo operations with an embedded Gemini AI Strategic Advisor.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
