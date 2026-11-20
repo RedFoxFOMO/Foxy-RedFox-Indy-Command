@@ -1,5 +1,5 @@
 <div align="center">
-  <img src="./public/foxy-indy-banner.png" alt="Foxy RedFox Indy Command Banner" width="100%" />
+  <img src="./public/foxy-indy-banner.jpg" alt="Foxy RedFox Indy Command Banner" width="100%" />
 </div>
 
 # Foxy RedFox Indy Command
