@@ -6,7 +6,7 @@
 
 **An end-to-end EVE Online fleet logistics, regional market arbitrage, and industrial command suite powered by CCP's live ESI API.**
 
-**Live App:** [Foxy RedFox Indy Command](https://new-eden-trade-indy-command-502218736450.europe-west3.run.app/)
+**Live App:** Not available - Private.
 
 ---
 
