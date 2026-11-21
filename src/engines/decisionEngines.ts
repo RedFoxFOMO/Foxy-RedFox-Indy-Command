@@ -1,5 +1,7 @@
 import {
   CORRIDOR_SYSTEMS,
+  DEFAULT_INDUSTRY_STRUCTURE_CONFIG,
+  EMPIRE_HUB_MAP,
   EVE_ANCHORS,
   EVE_ITEMS,
   INDUSTRY_RECIPES,
@@ -18,6 +20,8 @@ import type {
   EveItem,
   HubQuote,
   HullClass,
+  IndustryCostSnapshot,
+  IndustryStructureConfig,
   MarketCategoryId,
   MarketQuote,
   MarketSnapshot,
@@ -26,6 +30,7 @@ import type {
   RouteChain,
   RouteItemSpec,
   ShoppingListLine,
+  TradeHubId,
 } from '../types/eve.ts';
 
 // --- Formatters ---
@@ -158,7 +163,87 @@ function getRegionForSystemId(systemId: number): number {
   if (systemId === EVE_ANCHORS.DODIXIE_SYSTEM_ID) {
     return EVE_ANCHORS.SINQ_LAISON_REGION_ID;
   }
+  if (systemId === EVE_ANCHORS.AMARR_SYSTEM_ID) {
+    return EVE_ANCHORS.DOMAIN_REGION_ID;
+  }
+  if (systemId === EVE_ANCHORS.RENS_SYSTEM_ID) {
+    return EVE_ANCHORS.HEIMATAR_REGION_ID;
+  }
+  if (systemId === EVE_ANCHORS.HEK_SYSTEM_ID) {
+    return EVE_ANCHORS.METROPOLIS_REGION_ID;
+  }
   return EVE_ANCHORS.THE_FORGE_REGION_ID;
+}
+
+export function getHubQuote(
+  quote: MarketQuote,
+  hubId: TradeHubId,
+  item?: EveItem
+): HubQuote {
+  if (quote.hubs && quote.hubs[hubId] && (quote.hubs[hubId]!.sellMin > 0 || quote.hubs[hubId]!.buyMax > 0)) {
+    return quote.hubs[hubId]!;
+  }
+  if (hubId === 'jita') return quote.jita;
+  if (hubId === 'dodixie') return quote.dodixie;
+
+  const hubDef = EMPIRE_HUB_MAP[hubId];
+  const baseJitaSell = quote.jita.sellMin > 0 ? quote.jita.sellMin : item?.baseJitaSell ?? 1000;
+  const baseJitaBuy = quote.jita.buyMax > 0 ? quote.jita.buyMax : baseJitaSell * 0.9;
+  const estVol = Math.max(
+    1,
+    Math.round((quote.jita.sellVolume || item?.estDailyJitaVol || 500) * hubDef.volMultiplierFallback)
+  );
+  const estSell = Number((baseJitaSell * hubDef.priceMultiplierFallback).toFixed(2));
+  const estBuy = Number((baseJitaBuy * (1 + (hubDef.priceMultiplierFallback - 1) * 0.45)).toFixed(2));
+
+  return {
+    sellMin: estSell,
+    sellVolume: estVol,
+    buyMax: estBuy,
+    buyVolume: Math.max(1, Math.round(estVol * 0.65)),
+    sellPercentile: estSell,
+    buyPercentile: estBuy,
+    avgDailyVol7d: Math.max(1, Math.round(estVol * 0.25)),
+  };
+}
+
+export function getUpwellStructureBonuses(config: IndustryStructureConfig): {
+  label: string;
+  structMeBonus: number;
+  structTeBonus: number;
+  structCostBonus: number;
+  rigMeBonus: number;
+  rigTeBonus: number;
+  rigCostBonus: number;
+  effectiveMeMult: number;
+  effectiveCostMult: number;
+} {
+  const isNpc = config.structureType === 'npc_station';
+  const structSpec =
+    config.structureType === 'sotiyo'
+      ? { label: 'Sotiyo', me: 0.01, te: 0.3, cost: 0.05 }
+      : config.structureType === 'azbel'
+        ? { label: 'Azbel', me: 0.01, te: 0.2, cost: 0.04 }
+        : config.structureType === 'raitaru'
+          ? { label: 'Raitaru', me: 0.01, te: 0.15, cost: 0.03 }
+          : { label: 'NPC Station', me: 0, te: 0, cost: 0 };
+
+  // High-Sec Upwell Engineering Rig bonuses (1.0x security multiplier)
+  const rigMeBonus = isNpc ? 0 : config.meRig === 't2' ? 0.024 : config.meRig === 't1' ? 0.02 : 0;
+  const rigTeBonus = isNpc ? 0 : config.teRig === 't2' ? 0.24 : config.teRig === 't1' ? 0.2 : 0;
+  const rigCostBonus = isNpc ? 0 : config.costRig === 't2' ? 0.12 : config.costRig === 't1' ? 0.1 : 0;
+
+  return {
+    label: structSpec.label,
+    structMeBonus: structSpec.me,
+    structTeBonus: structSpec.te,
+    structCostBonus: structSpec.cost,
+    rigMeBonus,
+    rigTeBonus,
+    rigCostBonus,
+    effectiveMeMult: (1 - structSpec.me) * (1 - rigMeBonus),
+    effectiveCostMult: (1 - structSpec.cost) * (1 - rigCostBonus),
+  };
 }
 
 function attachActiveOrderConflicts(
@@ -302,7 +387,9 @@ export function pickHull(
 function computeIndyAndInvention(
   checked: Set<MarketCategoryId>,
   snapshot: MarketSnapshot,
-  profile: PilotProfile
+  profile: PilotProfile,
+  structureConfig: IndustryStructureConfig = DEFAULT_INDUSTRY_STRUCTURE_CONFIG,
+  industryCosts?: IndustryCostSnapshot
 ): {
   cards: ActionCardData[];
   shoppingList: ShoppingListLine[];
@@ -311,6 +398,28 @@ function computeIndyAndInvention(
   const fees = getEffectiveOrderFees(profile);
   const { executionMode, totalSellFeeRate: totalSellFee, salesTaxPct, brokerFeePct } = fees;
   const budgetCap = profile.activeCapitalCap;
+  const bonuses = getUpwellStructureBonuses(structureConfig);
+  const sysIndices = industryCosts?.costIndicesBySystem[structureConfig.systemId];
+  const liveMfgIndex = sysIndices?.manufacturing ?? 0.024;
+  const liveInvIndex = sysIndices?.invention ?? 0.018;
+  const sccSurcharge = 0.04; // EVE Online 4.0% SCC surcharge on industry jobs
+  const facilityTaxRate = Math.max(0, structureConfig.facilityTaxPct) / 100;
+  const isNpcStation = structureConfig.structureType === 'npc_station';
+  const facilityLabel = isNpcStation
+    ? structureConfig.systemId === EVE_ANCHORS.ISHISOMO_SYSTEM_ID
+      ? 'Ishisomo VIII - State War Academy (NPC)'
+      : `${structureConfig.systemName} NPC Factory`
+    : `${structureConfig.systemName} ${bonuses.label}${
+        structureConfig.meRig !== 'none' || structureConfig.costRig !== 'none'
+          ? ` (${[
+              structureConfig.meRig !== 'none' ? `ME ${structureConfig.meRig.toUpperCase()}` : '',
+              structureConfig.teRig !== 'none' ? `TE ${structureConfig.teRig.toUpperCase()}` : '',
+              structureConfig.costRig !== 'none' ? `Cost ${structureConfig.costRig.toUpperCase()}` : '',
+            ]
+              .filter(Boolean)
+              .join(' · ')})`
+          : ''
+      }`;
 
   const matchingRecipes = INDUSTRY_RECIPES.filter((r) => checked.has(r.category));
   const cards: ActionCardData[] = [];
@@ -334,16 +443,15 @@ function computeIndyAndInvention(
         ? ownedBp?.me ?? recipe.invention?.t2Me ?? 2
         : ownedBp?.me ?? 10;
 
-    // NPC station = 0% structure ME bonus, so only blueprint ME applies
-    const meMultiplier = 1 - effectiveMe / 100;
+    // Multiplicative EVE ME formula: (1 - BP_ME) * (1 - Structure_ME) * (1 - Rig_ME)
+    const meMultiplier = (1 - effectiveMe / 100) * bonuses.effectiveMeMult;
 
-    // Invention cost per run (vanilla no-decryptor at Propel Dynamics Factory)
+    // Invention cost per run (using live system invention index + structure cost bonus)
     let inventionCostPerRun = 0;
     let inventionSuccessPct = 0;
-    let inventionMetaText = 'Direct T1 BPO Build';
+    let inventionMetaText = `Direct T1 BPO Build · ${bonuses.label}`;
 
     if (recipe.tier === 'T2' && recipe.invention) {
-      // Science/Encryption V: base * (1 + (5 + 5)/30 + 5/40) = base * 1.4583
       const skillMult = 1 + (profile.skills.scienceEncryption * 2) / 30 + profile.skills.scienceEncryption / 40;
       const prob = Math.min(0.85, recipe.invention.baseChance * skillMult);
       inventionSuccessPct = prob * 100;
@@ -353,25 +461,31 @@ function computeIndyAndInvention(
         const q = getQuote(snapshot, dc.typeId);
         attemptCost += q.jita.sellMin * dc.quantity;
       }
-      // Small NPC copy + invention job fee (~2.8% of attempt datacore value)
-      attemptCost *= 1.035;
+      const invFeeFactor = 1 + liveInvIndex * bonuses.effectiveCostMult + facilityTaxRate + sccSurcharge * 0.25;
+      attemptCost *= invFeeFactor;
       const expectedCostPerT2Bpc = attemptCost / prob;
       inventionCostPerRun = expectedCostPerT2Bpc / recipe.invention.bpcRunsOutput;
-      inventionMetaText = `Vanilla Invention (${inventionSuccessPct.toFixed(1)}% success · ME ${recipe.invention.t2Me}/TE ${recipe.invention.t2Te} · ${recipe.invention.bpcRunsOutput} runs/BPC)`;
+      inventionMetaText = `Vanilla Invention (${inventionSuccessPct.toFixed(1)}% · ME ${recipe.invention.t2Me}/TE ${recipe.invention.t2Te} · ${bonuses.label})`;
     }
 
-    // Material cost per run
+    // Material cost per run + Estimated Item Value (EIV) from live CCP /markets/prices/
     let singleRunMatCost = 0;
     let singleRunMatVol = 0;
+    let singleRunEiv = 0;
     for (const mat of recipe.baseMaterials) {
       const qty = Math.max(1, Math.ceil(mat.quantity * meMultiplier));
       const q = getQuote(snapshot, mat.typeId);
       const item = ITEM_BY_ID[mat.typeId];
       singleRunMatCost += qty * q.jita.sellMin;
       singleRunMatVol += qty * (item?.volume ?? 0.1);
+      const adjPrice = industryCosts?.adjustedPricesByType[mat.typeId] ?? q.jita.sellMin;
+      singleRunEiv += mat.quantity * adjPrice;
     }
 
-    const singleRunJobFee = singleRunMatCost * recipe.jobCostPct;
+    // Live CCP formula: EIV * (SystemCostIndex * StructureCostMult + FacilityTax + SCC 4%)
+    const effectiveJobRate = liveMfgIndex * bonuses.effectiveCostMult + facilityTaxRate + sccSurcharge;
+    const singleRunJobFee =
+      singleRunEiv > 0 ? singleRunEiv * effectiveJobRate : singleRunMatCost * recipe.jobCostPct;
     const singleRunTotalCost = singleRunMatCost + singleRunJobFee + inventionCostPerRun;
 
     // Evaluate Jita vs Dodixie exit price under active execution mode (Instant Fill = Buy Orders, List Orders = Sell Orders)
@@ -503,18 +617,18 @@ function computeIndyAndInvention(
       const bpcNeeded = Math.max(1, Math.ceil(runs / recipe.invention.bpcRunsOutput));
       const attemptsNeeded = Math.ceil(bpcNeeded / Math.max(0.25, inventionSuccessPct / 100));
       steps.push(
-        `At Propel Dynamics Factory (Ishisomo VII - M14), copy ${attemptsNeeded}x ${recipe.invention.t1SourceName} and run vanilla T2 invention (no decryptors) for ~${bpcNeeded}x ME2/TE4 BPCs.`
+        `In ${structureConfig.systemName} (${bonuses.label}), copy ${attemptsNeeded}× ${recipe.invention.t1SourceName} and run vanilla T2 invention (Index ${(liveInvIndex * 100).toFixed(2)}%) for ~${bpcNeeded}× ME2/TE4 BPCs.`
       );
     } else {
       steps.push(
-        `Load ${recipe.productName} BPO (ME ${effectiveMe}) at State War Academy (Ishisomo VIII - M11, NPC 0% structure ME).`
+        `Load ${recipe.productName} BPO (ME ${effectiveMe}) at ${facilityLabel} (Total ME reduction ${((1 - meMultiplier) * 100).toFixed(2)}%).`
       );
     }
     steps.push(
-      `Buy consolidated inputs in Jita 4-4 (${formatIsk(totalMatCost)}, ${formatM3(inputVolume)}) and haul 3 jumps to Ishisomo in ${hull.label.split(' (')[0]}.`
+      `Buy consolidated inputs in Jita 4-4 (${formatIsk(totalMatCost)}, ${formatM3(inputVolume)}) and haul to ${structureConfig.systemName} in ${hull.label.split(' (')[0]}.`
     );
     steps.push(
-      `Queue ${runs} run${runs > 1 ? 's' : ''} (${totalOutputUnits.toLocaleString('en-US')} units) at State War Academy; NPC install fee ~${formatIsk(totalJobFee)}.`
+      `Queue ${runs} run${runs > 1 ? 's' : ''} (${totalOutputUnits.toLocaleString('en-US')} units) at ${facilityLabel}; install fee ~${formatIsk(totalJobFee)} (Mfg Index ${(liveMfgIndex * 100).toFixed(2)}% + Tax ${structureConfig.facilityTaxPct.toFixed(2)}% + 4% SCC).`
     );
     steps.push(
       `Haul finished output (${formatM3(outputVolume)}) to ${targetHub} and ${
@@ -527,16 +641,13 @@ function computeIndyAndInvention(
     cards.push({
       id: `indy-${recipe.id}`,
       engine: 'indy_invention',
-      engineLabel: recipe.tier === 'T2' ? 'Ishisomo T2 Invention & Mfg' : 'Ishisomo T1 Manufacturing',
+      engineLabel: recipe.tier === 'T2' ? `${structureConfig.systemName} T2 Invention & Mfg` : `${structureConfig.systemName} T1 Manufacturing`,
       title: `${recipe.productName} × ${totalOutputUnits.toLocaleString('en-US')}`,
       subtitle: `${inventionMetaText} · Sell in ${targetHub}`,
       categories: [recipe.category],
       primaryTypeId: recipe.productTypeId,
       primaryItemName: recipe.productName,
-      stationAnchor:
-        recipe.tier === 'T2'
-          ? 'Propel Dynamics Factory -> State War Academy'
-          : 'Ishisomo VIII - State War Academy',
+      stationAnchor: facilityLabel,
       recommendedHull: hull.label,
       hullClass: hull.hullClass,
       requiredCapitalIsk: requiredCapital,
@@ -557,7 +668,7 @@ function computeIndyAndInvention(
       riskLabel: roiPct >= 14 ? 'High Margin' : roiPct >= 6 ? 'Nominal' : 'Watch Depth',
       steps,
       inspection: {
-        summaryText: `NPC Manufacturing at State War Academy (0% structure ME bonus, ME ${effectiveMe} blueprint). Estimated job install fee: ${formatIsk(totalJobFee)}${
+        summaryText: `${facilityLabel} · Live Mfg Cost Index: ${(liveMfgIndex * 100).toFixed(2)}% (${industryCosts?.source === 'esi_live' ? 'CCP ESI Live' : 'Baseline'}) · Effective ME Reduction: ${((1 - meMultiplier) * 100).toFixed(2)}% · Install Fee: ${formatIsk(totalJobFee)}${
           totalInventionCost > 0 ? ` · Vanilla T2 Invention amortized cost: ${formatIsk(totalInventionCost)}` : ''
         }.`,
         columns: [
@@ -1326,21 +1437,27 @@ function computeCorridorArbitrage(
   return cards;
 }
 
-// --- Engine 4: Regional Trade Manifesto (Jita <-> Dodixie) ---
+// --- Engine 4: 5-Hub Empire Trade Manifesto (Jita, Amarr, Dodixie, Rens, Hek) ---
 
 function computeRegionalTradeManifests(
   checked: Set<MarketCategoryId>,
   snapshot: MarketSnapshot,
   profile: PilotProfile,
   catalog?: DynamicMarketCatalog,
-  minDailyVolume = 20
+  minDailyVolume = 20,
+  sourceHubId: TradeHubId = 'jita',
+  destHubId: TradeHubId = 'dodixie'
 ): ActionCardData[] {
+  const effectiveSourceHubId = sourceHubId;
+  const effectiveDestHubId = destHubId === sourceHubId ? (sourceHubId === 'jita' ? 'dodixie' : 'jita') : destHubId;
+  const sourceHubDef = EMPIRE_HUB_MAP[effectiveSourceHubId];
+  const destHubDef = EMPIRE_HUB_MAP[effectiveDestHubId];
+
   const fees = getEffectiveOrderFees(profile);
   const { executionMode, totalSellFeeRate, salesTaxPct, brokerFeePct } = fees;
   const sellFeeMult = 1 - totalSellFeeRate;
   const budgetCap = profile.activeCapitalCap;
 
-  // Merge baseline EveItems + all dynamically discovered ESI catalog SKUs for checked categories
   const activeItemMap = new Map<number, EveItem>();
   for (const baseItem of getItemsForCategories(Array.from(checked))) {
     activeItemMap.set(baseItem.typeId, baseItem);
@@ -1386,25 +1503,26 @@ function computeRegionalTradeManifests(
   }
 
   function buildManifest(
-    direction: 'jita_to_dodixie' | 'dodixie_to_jita',
+    direction: 'outbound' | 'backhaul',
     maxCargoM3: number,
     hullClass: HullClass,
     hullLabel: string
   ): ActionCardData | null {
+    const fromHub = direction === 'outbound' ? sourceHubDef : destHubDef;
+    const toHub = direction === 'outbound' ? destHubDef : sourceHubDef;
     const candidates: ManifestCandidate[] = [];
 
     for (const item of activeItems) {
       const liveQuote = snapshot.quotes[item.typeId];
-      // For dynamically discovered SKUs without baseline pricing, require live Jita + Dodixie quotes
       if (!ITEM_BY_ID[item.typeId] && (!liveQuote || liveQuote.source !== 'live')) {
         continue;
       }
       const q = liveQuote ?? getQuote(snapshot, item.typeId);
-      const isOutbound = direction === 'jita_to_dodixie';
-      const buyPrice = isOutbound ? q.jita.sellMin : q.dodixie.sellMin;
-      const destHub = isOutbound ? q.dodixie : q.jita;
-      // Instant Fill sells directly into destination buy orders (Sales Tax only); List Orders lists at destination sellMin (Sales Tax + Broker)
-      const sellPrice = executionMode === 'instant_fill' ? destHub.buyMax : destHub.sellMin;
+      const fromQuote = getHubQuote(q, fromHub.id, item);
+      const toQuote = getHubQuote(q, toHub.id, item);
+
+      const buyPrice = fromQuote.sellMin;
+      const sellPrice = executionMode === 'instant_fill' ? toQuote.buyMax : toQuote.sellMin;
       if (buyPrice <= 0 || sellPrice <= 0) continue;
 
       const netUnitProfit = sellPrice * sellFeeMult - buyPrice;
@@ -1413,13 +1531,16 @@ function computeRegionalTradeManifests(
       const minRoiThreshold = executionMode === 'instant_fill' ? 1.5 : 4.5;
       if (netUnitProfit <= 0 || roiPct < minRoiThreshold || roiPct > 450) continue;
 
-      // Destination order-book depth & 7-day average daily trading volume liquidity cap
       const minProfitableSellPrice = (buyPrice * 1.01) / Math.max(0.1, sellFeeMult);
-      const fallbackVol = isOutbound
-        ? q.estDailyDodixieVol ?? item.estDailyDodixieVol
-        : q.estDailyJitaVol ?? item.estDailyJitaVol;
+      const fallbackVol =
+        toHub.id === 'jita'
+          ? q.estDailyJitaVol ?? item.estDailyJitaVol
+          : toHub.id === 'dodixie'
+            ? q.estDailyDodixieVol ?? item.estDailyDodixieVol
+            : Math.max(10, Math.round((q.estDailyJitaVol ?? item.estDailyJitaVol) * toHub.volMultiplierFallback));
+
       const depth = getAbsorbableMarketDepth({
-        hub: destHub,
+        hub: toQuote,
         fallbackDailyVol: fallbackVol,
         minProfitableSellPrice,
         executionMode,
@@ -1444,7 +1565,6 @@ function computeRegionalTradeManifests(
       });
     }
 
-    // Rank by profit/m³ for Blockade Runner, or ROI*depth score for DST
     candidates.sort((a, b) =>
       hullClass === 'blockade_runner'
         ? b.profitPerM3 - a.profitPerM3
@@ -1464,7 +1584,6 @@ function computeRegionalTradeManifests(
 
     for (const c of candidates) {
       if (remainingIsk < 5_000_000 || remainingM3 < 1) break;
-      // Diversify: no single SKU consumes >28% of total capital cap
       const skuBudget = Math.min(remainingIsk, budgetCap * 0.28);
       const maxByIsk = Math.floor(skuBudget / c.buyPrice);
       const maxByM3 = Math.floor(remainingM3 / c.volumePerUnit);
@@ -1494,18 +1613,14 @@ function computeRegionalTradeManifests(
     const totalRoi = totalCost > 0 ? (totalProfit / totalCost) * 100 : 0;
     const totalNetMargin = totalGrossRev > 0 ? (totalProfit / totalGrossRev) * 100 : 0;
 
-    const isOutbound = direction === 'jita_to_dodixie';
-    const routeLabel = isOutbound ? 'Jita 4-4 -> Dodixie IX-20' : 'Dodixie IX-20 -> Jita 4-4';
-    const destRegionId = isOutbound
-      ? EVE_ANCHORS.SINQ_LAISON_REGION_ID
-      : EVE_ANCHORS.THE_FORGE_REGION_ID;
+    const routeLabel = `${fromHub.shortName} -> ${toHub.shortName}`;
 
     return {
-      id: `trade-${direction}-${hullClass}`,
+      id: `trade-${fromHub.id}-to-${toHub.id}-${hullClass}`,
       engine: 'regional_trade',
-      engineLabel: `Regional Trade Manifesto (${isOutbound ? 'Outbound' : 'Backhaul'})`,
+      engineLabel: `5-Hub Empire Trade (${direction === 'outbound' ? 'Outbound' : 'Backhaul'})`,
       title: `${routeLabel} · ${hullClass === 'blockade_runner' ? 'High-Value Express' : 'Bulk DST Manifest'}`,
-      subtitle: `${packed.length} SKUs capped by destination order depth (${executionMode === 'instant_fill' ? 'Instant Fill' : 'List Orders'})`,
+      subtitle: `${packed.length} SKUs capped by ${toHub.shortName} order depth (${executionMode === 'instant_fill' ? 'Instant Fill' : 'List Orders'})`,
       categories: Array.from(new Set(packed.map((p) => p.item.category))),
       primaryTypeId: packed[0]?.item.typeId,
       primaryItemName: packed[0]?.item.name,
@@ -1518,8 +1633,8 @@ function computeRegionalTradeManifests(
       marketDepthUnits: totalDepthCapUnits,
       marketDepthDetail:
         executionMode === 'instant_fill'
-          ? 'Capped to live destination buy-book depth @ profitable floor ∩ 25% 7d avg'
-          : 'Capped to max 25% of 7-day avg daily destination trading volume',
+          ? `Capped to live ${toHub.shortName} buy-book depth @ profitable floor ∩ 25% 7d avg`
+          : `Capped to max 25% of 7-day avg daily ${toHub.shortName} trading volume`,
       outputUnits: totalQty,
       perUnitNetProfitIsk: totalQty > 0 ? totalProfit / totalQty : 0,
       netProfitIsk: totalProfit,
@@ -1529,31 +1644,27 @@ function computeRegionalTradeManifests(
       executionMode,
       salesTaxPct,
       brokerFeePct,
-      destinationRegionId: destRegionId,
+      destinationRegionId: toHub.regionId,
       riskLabel: totalCost > 650_000_000 && hullClass !== 'blockade_runner' ? 'Watch Depth' : 'High Margin',
       steps: [
-        `Buy ${packed.length} manifest lines in ${isOutbound ? 'Jita 4-4' : 'Dodixie IX-20'} totaling ${formatIsk(totalCost)} (${formatM3(totalVol)} / ${((totalVol / maxCargoM3) * 100).toFixed(0)}% hull fill).`,
-        `Transit high-sec route (${isOutbound ? 'Jita -> Perimeter -> Uedama -> Dodixie, 12 jumps' : 'Dodixie -> Uedama -> Jita, 12 jumps'}) using ${
-          hullClass === 'blockade_runner' ? 'covert cloak + MWD warp trick' : 'MWD + Cloak trick & gank scout check in Uedama'
+        `Buy ${packed.length} manifest lines at ${fromHub.stationName} totaling ${formatIsk(totalCost)} (${formatM3(totalVol)} / ${((totalVol / maxCargoM3) * 100).toFixed(0)}% hull fill).`,
+        `Transit high-sec Empire corridor (${fromHub.shortName} -> ${toHub.shortName}) using ${
+          hullClass === 'blockade_runner' ? 'covert cloak + MWD warp trick' : 'MWD + Cloak trick & gatecamp intel check'
         }.`,
-        `${executionMode === 'instant_fill' ? 'Instant-sell into buy orders' : 'List sell orders'} in ${isOutbound ? 'Dodixie IX - Moon 20' : 'Jita IV - Moon 4'} for ${formatIsk(totalProfit)} true after-tax profit (${totalNetMargin.toFixed(1)}% Net Margin · Tax ${salesTaxPct.toFixed(2)}%${brokerFeePct > 0 ? ` + Broker ${brokerFeePct.toFixed(2)}%` : ' · 0% Broker'}).`,
+        `${executionMode === 'instant_fill' ? 'Instant-sell into buy orders' : 'List sell orders'} at ${toHub.stationName} for ${formatIsk(totalProfit)} true after-tax profit (${totalNetMargin.toFixed(1)}% Net Margin · Tax ${salesTaxPct.toFixed(2)}%${brokerFeePct > 0 ? ` + Broker ${brokerFeePct.toFixed(2)}%` : ' · 0% Broker'}).`,
       ],
       inspection: {
-        summaryText: `Packed manifest honoring active float (${formatIsk(budgetCap)}), ${hullLabel} cargo limit, and realistic destination market depth (≤25% 7d avg daily volume${executionMode === 'instant_fill' ? ' & live buy-book floor depth' : ''}).`,
+        summaryText: `5-Hub Empire Trade manifest (${fromHub.shortName} -> ${toHub.shortName}) honoring active float (${formatIsk(budgetCap)}), ${hullLabel} cargo limit, and realistic ${toHub.shortName} market depth.`,
         columns: [
           { key: 'item', label: 'SKU', align: 'left' },
           { key: 'qty', label: 'Qty', align: 'right' },
-          { key: 'buy', label: isOutbound ? 'Jita Sell' : 'Dodixie Sell', align: 'right' },
+          { key: 'buy', label: `${fromHub.shortName} Sell`, align: 'right' },
           {
             key: 'sell',
             label:
               executionMode === 'instant_fill'
-                ? isOutbound
-                  ? 'Dodixie Buy'
-                  : 'Jita Buy'
-                : isOutbound
-                  ? 'Dodixie Sell'
-                  : 'Jita Sell',
+                ? `${toHub.shortName} Buy`
+                : `${toHub.shortName} Sell`,
             align: 'right',
           },
           { key: 'vol', label: 'Volume', align: 'right' },
@@ -1574,15 +1685,15 @@ function computeRegionalTradeManifests(
       },
       routeChains: [
         {
-          cardId: `trade-${direction}-${hullClass}`,
+          cardId: `trade-${fromHub.id}-to-${toHub.id}-${hullClass}`,
           cardTitle: `${routeLabel} · ${hullClass === 'blockade_runner' ? 'Express' : 'DST'}`,
           legs: [
             {
               action: 'buy',
-              systemId: isOutbound ? EVE_ANCHORS.JITA_SYSTEM_ID : EVE_ANCHORS.DODIXIE_SYSTEM_ID,
-              systemName: isOutbound ? 'Jita' : 'Dodixie',
-              stationId: isOutbound ? EVE_ANCHORS.JITA_STATION_ID : EVE_ANCHORS.DODIXIE_STATION_ID,
-              stationName: isOutbound ? EVE_ANCHORS.JITA_STATION_NAME : EVE_ANCHORS.DODIXIE_STATION_NAME,
+              systemId: fromHub.systemId,
+              systemName: fromHub.systemName,
+              stationId: fromHub.stationId,
+              stationName: fromHub.stationName,
               items: packed.map((p) => ({
                 typeId: p.item.typeId,
                 name: p.item.name,
@@ -1595,10 +1706,10 @@ function computeRegionalTradeManifests(
             },
             {
               action: 'sell',
-              systemId: isOutbound ? EVE_ANCHORS.DODIXIE_SYSTEM_ID : EVE_ANCHORS.JITA_SYSTEM_ID,
-              systemName: isOutbound ? 'Dodixie' : 'Jita',
-              stationId: isOutbound ? EVE_ANCHORS.DODIXIE_STATION_ID : EVE_ANCHORS.JITA_STATION_ID,
-              stationName: isOutbound ? EVE_ANCHORS.DODIXIE_STATION_NAME : EVE_ANCHORS.JITA_STATION_NAME,
+              systemId: toHub.systemId,
+              systemName: toHub.systemName,
+              stationId: toHub.stationId,
+              stationName: toHub.stationName,
               items: packed.map((p) => ({
                 typeId: p.item.typeId,
                 name: p.item.name,
@@ -1617,9 +1728,9 @@ function computeRegionalTradeManifests(
   }
 
   const cards: ActionCardData[] = [];
-  const brOutbound = buildManifest('jita_to_dodixie', brCap, 'blockade_runner', `Crane Blockade Runner (${formatM3(brCap)})`);
-  const dstOutbound = buildManifest('jita_to_dodixie', dstCap, 'dst', `Bustard DST (${formatM3(dstCap)})`);
-  const backhaul = buildManifest('dodixie_to_jita', dstCap, 'dst', `Bustard DST (${formatM3(dstCap)})`);
+  const brOutbound = buildManifest('outbound', brCap, 'blockade_runner', `Crane Blockade Runner (${formatM3(brCap)})`);
+  const dstOutbound = buildManifest('outbound', dstCap, 'dst', `Bustard DST (${formatM3(dstCap)})`);
+  const backhaul = buildManifest('backhaul', dstCap, 'dst', `Bustard DST (${formatM3(dstCap)})`);
 
   if (brOutbound) cards.push(brOutbound);
   if (dstOutbound) cards.push(dstOutbound);
@@ -1848,7 +1959,14 @@ export function runAllDecisionEngines(
   checkedCategories: MarketCategoryId[],
   snapshot: MarketSnapshot,
   profile: PilotProfile,
-  options?: { catalog?: DynamicMarketCatalog; minDailyVolume?: number }
+  options?: {
+    catalog?: DynamicMarketCatalog;
+    minDailyVolume?: number;
+    sourceHub?: TradeHubId;
+    destHub?: TradeHubId;
+    structureConfig?: IndustryStructureConfig;
+    industryCosts?: IndustryCostSnapshot;
+  }
 ): EngineBundle {
   const checkedSet = new Set(checkedCategories);
   const activeTrackedItemCount = options?.catalog
@@ -1869,7 +1987,13 @@ export function runAllDecisionEngines(
     };
   }
 
-  const indy = computeIndyAndInvention(checkedSet, snapshot, profile);
+  const indy = computeIndyAndInvention(
+    checkedSet,
+    snapshot,
+    profile,
+    options?.structureConfig ?? DEFAULT_INDUSTRY_STRUCTURE_CONFIG,
+    options?.industryCosts
+  );
   const reproc = computeReprocessingArbitrage(checkedSet, snapshot, profile, indy.mineralDemand);
   const corridor = computeCorridorArbitrage(checkedSet, snapshot, profile);
   const trade = computeRegionalTradeManifests(
@@ -1877,7 +2001,9 @@ export function runAllDecisionEngines(
     snapshot,
     profile,
     options?.catalog,
-    options?.minDailyVolume ?? 20
+    options?.minDailyVolume ?? 20,
+    options?.sourceHub ?? 'jita',
+    options?.destHub ?? 'dodixie'
   );
   const pi = computePiFactoryEvaluator(checkedSet, snapshot, profile);
 

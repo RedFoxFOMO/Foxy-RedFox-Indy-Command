@@ -1,6 +1,10 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   CheckSquare,
+  ChevronDown,
+  ChevronUp,
+  ChevronsDownUp,
+  ChevronsUpDown,
   KeyRound,
   Route,
   ScrollText,
@@ -10,21 +14,29 @@ import {
 } from 'lucide-react';
 import { ActionCard } from './components/ActionCard.tsx';
 import { AdvisorSidebar } from './components/AdvisorSidebar.tsx';
+import { ApiSetupModal } from './components/ApiSetupModal.tsx';
 import { BlueprintLibraryPanel } from './components/BlueprintLibraryPanel.tsx';
 import { CategorySkuModal } from './components/CategorySkuModal.tsx';
+import { IndustryFacilityBar } from './components/IndustryFacilityBar.tsx';
+import { IndustryJobsPanel } from './components/IndustryJobsPanel.tsx';
 import { InspectDrawer } from './components/InspectDrawer.tsx';
 import { JitaDodixieChart } from './components/JitaDodixieChart.tsx';
 import { MarketHistoryModal } from './components/MarketHistoryModal.tsx';
 import { MarketScopeBar } from './components/MarketScopeBar.tsx';
+import { OrderMonitorOverlay } from './components/OrderMonitorOverlay.tsx';
 import { OverviewProfitChart } from './components/OverviewProfitChart.tsx';
 import { RouteOptimizerSidebar } from './components/RouteOptimizerSidebar.tsx';
 import { SettingsModal } from './components/SettingsModal.tsx';
 import { TopBar } from './components/TopBar.tsx';
 import type { WorkspaceView } from './components/TopBar.tsx';
+import { WatchlistPanel } from './components/WatchlistPanel.tsx';
 import {
+  DEFAULT_INDUSTRY_STRUCTURE_CONFIG,
   DEFAULT_SIMULATION_PROFILE,
+  EMPIRE_HUB_MAP,
   ITEM_BY_ID,
   SCOPE_PRESETS,
+  getItemsForCategories,
 } from './data/eveCatalog.ts';
 import {
   formatIsk,
@@ -44,15 +56,34 @@ import type {
   DynamicMarketCatalog,
   EngineId,
   EsiRateLimitState,
+  IndustryCostSnapshot,
+  IndustryStructureConfig,
   MarketCategoryDef,
   MarketCategoryId,
   MarketQuote,
   MarketScanProgress,
   MarketSnapshot,
   OrderExecutionMode,
+  OrderMonitorSnapshot,
   PilotProfile,
   ShoppingListLine,
+  TradeHubId,
+  WatchlistItem,
 } from './types/eve.ts';
+import {
+  getCurrentCallbackUrl,
+  loadCustomEveClientId,
+  loadCustomGeminiKey,
+  saveCustomEveClientId,
+  saveCustomGeminiKey,
+} from './utils/apiKeys.ts';
+import { setManyCardsCollapsed, useCollapsibleCard } from './utils/collapseStore.ts';
+import {
+  fetchCharacterIndustryJobsClient,
+  fetchHubQuotesDirect,
+  fetchIndustryCostIndicesClient,
+  fetchOrderMonitorClient,
+} from './utils/esiClientFallback.ts';
 import { buildEveAuthorizeUrl } from './utils/evePkce.ts';
 import {
   CATALOG_REBUILD_COOLDOWN_MS,
@@ -64,6 +95,7 @@ import {
   saveCachedCatalog,
   setCooldownUntil,
 } from './utils/marketCatalogCache.ts';
+import { loadWatchlist, saveWatchlist } from './utils/watchlistStore.ts';
 
 const ENGINE_SECTIONS: { id: EngineId; index: string; title: string; subtitle: string }[] = [
   {
@@ -121,12 +153,85 @@ function createWelcomeMessage(profile: PilotProfile): ChatMessage {
   };
 }
 
+const VALID_HUB_IDS: TradeHubId[] = ['jita', 'amarr', 'dodixie', 'rens', 'hek'];
+
+function loadStoredHub(key: string, fallback: TradeHubId): TradeHubId {
+  try {
+    const raw = localStorage.getItem(key) as TradeHubId | null;
+    if (raw && VALID_HUB_IDS.includes(raw)) return raw;
+  } catch {
+    // ignore storage restrictions
+  }
+  return fallback;
+}
+
+function loadStoredStructureConfig(): IndustryStructureConfig {
+  try {
+    const raw = localStorage.getItem('foxy_structure_config_v2');
+    if (raw) {
+      const parsed = JSON.parse(raw) as Partial<IndustryStructureConfig>;
+      if (parsed && typeof parsed.systemId === 'number' && parsed.structureType) {
+        return { ...DEFAULT_INDUSTRY_STRUCTURE_CONFIG, ...parsed };
+      }
+    }
+  } catch {
+    // ignore
+  }
+  return DEFAULT_INDUSTRY_STRUCTURE_CONFIG;
+}
+
+function loadStoredBoolean(key: string, fallback: boolean): boolean {
+  try {
+    const raw = localStorage.getItem(key);
+    if (raw === 'true') return true;
+    if (raw === 'false') return false;
+  } catch {
+    // ignore
+  }
+  return fallback;
+}
+
 export default function App() {
   const [activeView, setActiveView] = useState<WorkspaceView>('overview');
   const [checkedCategories, setCheckedCategories] = useState<MarketCategoryId[]>(
     SCOPE_PRESETS.all
   );
-  const [scopeExpanded, setScopeExpanded] = useState(true);
+  const [scopeCollapsed, toggleScopeCollapsed] = useCollapsibleCard('panel-market-scope', false);
+  const scopeExpanded = !scopeCollapsed;
+  const [summaryCollapsed, toggleSummaryCollapsed] = useCollapsibleCard('panel-command-summary', false);
+  const [allCardsCollapsed, setAllCardsCollapsed] = useState(false);
+
+  // 5-Hub Empire Trade Network state (persisted)
+  const [sourceHub, setSourceHub] = useState<TradeHubId>(() =>
+    loadStoredHub('foxy_source_hub_v2', 'jita')
+  );
+  const [destHub, setDestHub] = useState<TradeHubId>(() =>
+    loadStoredHub('foxy_dest_hub_v2', 'dodixie')
+  );
+
+  // Live CCP System Cost Indices & Upwell Structure Rig Config
+  const [structureConfig, setStructureConfig] = useState<IndustryStructureConfig>(
+    loadStoredStructureConfig
+  );
+  const [industryCosts, setIndustryCosts] = useState<IndustryCostSnapshot | null>(null);
+  const [isRefreshingCosts, setIsRefreshingCosts] = useState(false);
+
+  // Hangar Stock Deductor Toggle (persisted)
+  const [deductHangarStock, setDeductHangarStock] = useState<boolean>(() =>
+    loadStoredBoolean('foxy_deduct_hangar_v2', true)
+  );
+
+  // Pinned Watchlist & Margin Triggers (persisted)
+  const [watchlist, setWatchlist] = useState<WatchlistItem[]>(() => loadWatchlist());
+
+  // Order Monitor Overlay & Active Industry Jobs state
+  const [orderMonitorOpen, setOrderMonitorOpen] = useState(false);
+  const [orderMonitorData, setOrderMonitorData] = useState<OrderMonitorSnapshot | null>(null);
+  const [isRefreshingOrderMonitor, setIsRefreshingOrderMonitor] = useState(false);
+  const [orderMonitorError, setOrderMonitorError] = useState<string | null>(null);
+  const [isRefreshingJobs, setIsRefreshingJobs] = useState(false);
+  const [jobsError, setJobsError] = useState<string | null>(null);
+
   const [profile, setProfile] = useState<PilotProfile>(DEFAULT_SIMULATION_PROFILE);
 
   const [snapshot, setSnapshot] = useState<MarketSnapshot>({
@@ -172,27 +277,33 @@ export default function App() {
   const [historyTarget, setHistoryTarget] = useState<{ typeId: number; name: string } | null>(null);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [settingsInitialTab, setSettingsInitialTab] = useState<'sso' | 'profile' | 'assets'>('sso');
+  const [apiSetupOpen, setApiSetupOpen] = useState(false);
+  const [apiSetupReason, setApiSetupReason] = useState<string | null>(null);
 
   const openSettingsTab = useCallback((tab: 'sso' | 'profile' | 'assets') => {
     setSettingsInitialTab(tab);
     setSettingsOpen(true);
   }, []);
 
+  const openApiSetupModal = useCallback((reason: string | null = null) => {
+    setApiSetupReason(reason);
+    setApiSetupOpen(true);
+  }, []);
+
   const handleOpenHistory = useCallback((typeId: number, name: string) => {
     setHistoryTarget({ typeId, name });
   }, []);
 
-  // EVE SSO PKCE & Full Blueprint Scanner state
-  const [eveClientId, setEveClientId] = useState<string>(() => {
-    try {
-      return localStorage.getItem('new_eden_eve_client_id') || '';
-    } catch {
-      return '';
-    }
-  });
-  const [callbackUrl, setCallbackUrl] = useState<string>(
-    `${window.location.origin}/auth/callback`
-  );
+  // EVE SSO PKCE, BYOK ("Bring Your Own Keys") & Full Blueprint Scanner state
+  const buildEnvEveClientId = (import.meta.env.VITE_EVE_CLIENT_ID || '').trim();
+  const [envEveClientId, setEnvEveClientId] = useState<string>(buildEnvEveClientId);
+  const [hasEnvEveClientId, setHasEnvEveClientId] = useState<boolean>(Boolean(buildEnvEveClientId));
+  const [hasEnvGeminiKey, setHasEnvGeminiKey] = useState<boolean>(false);
+  const [customEveClientId, setCustomEveClientId] = useState<string>(() => loadCustomEveClientId());
+  const [customGeminiKey, setCustomGeminiKey] = useState<string>(() => loadCustomGeminiKey());
+  const effectiveEveClientId = (envEveClientId || customEveClientId).trim();
+
+  const [callbackUrl] = useState<string>(() => getCurrentCallbackUrl());
   const [ssoStatusMsg, setSsoStatusMsg] = useState<string | null>(null);
   const [isSsoConnecting, setIsSsoConnecting] = useState(false);
   const [eveAccessToken, setEveAccessToken] = useState<string | null>(null);
@@ -218,25 +329,35 @@ export default function App() {
   const [customShoppingItems, setCustomShoppingItems] = useState<CustomShoppingItem[]>([]);
   const [actionToast, setActionToast] = useState<string | null>(null);
 
-  // Fetch SSO config from server
+  // Fetch env-first public config flags from server (never leaks server GEMINI_API_KEY)
   useEffect(() => {
     fetch('/api/eve/sso-config')
       .then((r) => (r.ok ? r.json() : null))
-      .then((cfg: { callbackUrl?: string; serverClientId?: string } | null) => {
-        if (!cfg) return;
-        if (cfg.callbackUrl && cfg.callbackUrl.startsWith('http')) {
-          setCallbackUrl(cfg.callbackUrl);
-        } else {
-          setCallbackUrl(`${window.location.origin}/auth/callback`);
+      .then(
+        (
+          cfg: {
+            serverClientId?: string;
+            hasEnvEveClientId?: boolean;
+            hasEnvGeminiKey?: boolean;
+          } | null
+        ) => {
+          if (!cfg) return;
+          const serverId = (cfg.serverClientId || '').trim();
+          if (serverId) {
+            setEnvEveClientId(serverId);
+            setHasEnvEveClientId(true);
+          } else if (typeof cfg.hasEnvEveClientId === 'boolean') {
+            setHasEnvEveClientId(cfg.hasEnvEveClientId || Boolean(buildEnvEveClientId));
+          }
+          if (typeof cfg.hasEnvGeminiKey === 'boolean') {
+            setHasEnvGeminiKey(cfg.hasEnvGeminiKey);
+          }
         }
-        if (cfg.serverClientId && !eveClientId) {
-          setEveClientId(cfg.serverClientId);
-        }
-      })
+      )
       .catch(() => {
-        setCallbackUrl(`${window.location.origin}/auth/callback`);
+        // Static/offline deployment fallback: rely on VITE_* or browser localStorage keys
       });
-  }, []);
+  }, [buildEnvEveClientId]);
 
   // Live 1-second countdown ticker while any ESI cooldown or rate-limit pause is active
   const marketCooldownRemainingSec =
@@ -305,9 +426,156 @@ export default function App() {
     };
   }, []);
 
-  // Sync live Fuzzwork + EVE ESI market data for checked categories (initial load / category toggle)
+  // Persist v2.0.0 user preferences
+  const handleChangeSourceHub = useCallback(
+    (next: TradeHubId) => {
+      if (next === destHub) {
+        setDestHub(sourceHub);
+        try {
+          localStorage.setItem('foxy_dest_hub_v2', sourceHub);
+        } catch {
+          // ignore
+        }
+      }
+      setSourceHub(next);
+      try {
+        localStorage.setItem('foxy_source_hub_v2', next);
+      } catch {
+        // ignore
+      }
+    },
+    [destHub, sourceHub]
+  );
+
+  const handleChangeDestHub = useCallback(
+    (next: TradeHubId) => {
+      if (next === sourceHub) {
+        setSourceHub(destHub);
+        try {
+          localStorage.setItem('foxy_source_hub_v2', destHub);
+        } catch {
+          // ignore
+        }
+      }
+      setDestHub(next);
+      try {
+        localStorage.setItem('foxy_dest_hub_v2', next);
+      } catch {
+        // ignore
+      }
+    },
+    [destHub, sourceHub]
+  );
+
+  const handleSwapHubs = useCallback(() => {
+    setSourceHub(destHub);
+    setDestHub(sourceHub);
+    try {
+      localStorage.setItem('foxy_source_hub_v2', destHub);
+      localStorage.setItem('foxy_dest_hub_v2', sourceHub);
+    } catch {
+      // ignore
+    }
+  }, [destHub, sourceHub]);
+
+  const handleChangeStructureConfig = useCallback((next: IndustryStructureConfig) => {
+    setStructureConfig(next);
+    try {
+      localStorage.setItem('foxy_structure_config_v2', JSON.stringify(next));
+    } catch {
+      // ignore
+    }
+  }, []);
+
+  const handleToggleDeductHangarStock = useCallback((next: boolean) => {
+    setDeductHangarStock(next);
+    try {
+      localStorage.setItem('foxy_deduct_hangar_v2', String(next));
+    } catch {
+      // ignore
+    }
+  }, []);
+
+  // Fetch live CCP /industry/systems/ cost indices & /markets/prices/ adjusted prices on mount
+  const handleRefreshIndustryCosts = useCallback(async () => {
+    setIsRefreshingCosts(true);
+    try {
+      const next = await fetchIndustryCostIndicesClient();
+      setIndustryCosts(next);
+    } catch {
+      // Keep baseline/cached values gracefully
+    } finally {
+      setIsRefreshingCosts(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    void handleRefreshIndustryCosts();
+  }, [handleRefreshIndustryCosts]);
+
+  // Watchlist persistence & handlers
+  useEffect(() => {
+    saveWatchlist(watchlist);
+  }, [watchlist]);
+
+  const pinnedTypeIds = useMemo(
+    () => new Set(watchlist.map((w) => w.typeId)),
+    [watchlist]
+  );
+
+  const handleAddWatchlistItem = useCallback((item: WatchlistItem) => {
+    setWatchlist((prev) =>
+      prev.some((w) => w.typeId === item.typeId) ? prev : [item, ...prev]
+    );
+  }, []);
+
+  const handleUpdateWatchlistItem = useCallback(
+    (typeId: number, patch: Partial<WatchlistItem>) => {
+      setWatchlist((prev) =>
+        prev.map((w) => (w.typeId === typeId ? { ...w, ...patch } : w))
+      );
+    },
+    []
+  );
+
+  const handleRemoveWatchlistItem = useCallback((typeId: number) => {
+    setWatchlist((prev) => prev.filter((w) => w.typeId !== typeId));
+  }, []);
+
+  const handleTogglePinWatchlist = useCallback(
+    (typeId: number, name: string, kind: 'sku' | 'blueprint') => {
+      setWatchlist((prev) => {
+        if (prev.some((w) => w.typeId === typeId)) {
+          return prev.filter((w) => w.typeId !== typeId);
+        }
+        return [
+          {
+            id: `wl-${typeId}-${Date.now()}`,
+            typeId,
+            name,
+            kind,
+            minRoiPct: 12,
+            minIskPerM3: 1500,
+            pinnedAt: new Date().toISOString(),
+          },
+          ...prev,
+        ];
+      });
+    },
+    []
+  );
+
+  // Sync live Fuzzwork + EVE ESI market data for checked categories & selected Empire hubs
+  // Falls back directly to client-side Fuzzwork aggregates when deployed on static/serverless hosts
+  const snapshotRef = useRef(snapshot);
+  snapshotRef.current = snapshot;
+
   const syncLiveMarkets = useCallback(
-    async (cats: MarketCategoryId[], force = false) => {
+    async (
+      cats: MarketCategoryId[],
+      force = false,
+      hubs: TradeHubId[] = ['jita', 'dodixie']
+    ) => {
       if (cats.length === 0) {
         setSnapshot((prev) => ({
           ...prev,
@@ -317,10 +585,12 @@ export default function App() {
         return;
       }
 
+      const uniqueHubs = Array.from(new Set<TradeHubId>(['jita', 'dodixie', ...hubs]));
       setIsSyncing(true);
       try {
         const qs = new URLSearchParams({
           categories: cats.join(','),
+          hubs: uniqueHubs.join(','),
           force: force ? 'true' : 'false',
         });
         const res = await fetch(`/api/market/sync?${qs.toString()}`);
@@ -333,10 +603,19 @@ export default function App() {
           setNowTick(Date.now());
         }
         setSnapshot((prev) => {
-          const mergedQuotes: Record<number, MarketQuote> = {
-            ...prev.quotes,
-            ...data.quotes,
-          };
+          const mergedQuotes: Record<number, MarketQuote> = { ...prev.quotes };
+          for (const [k, incoming] of Object.entries(data.quotes)) {
+            const id = Number(k);
+            const existing = prev.quotes[id];
+            mergedQuotes[id] = {
+              ...existing,
+              ...incoming,
+              hubs: {
+                ...(existing?.hubs ?? {}),
+                ...(incoming.hubs ?? {}),
+              },
+            };
+          }
           const orderMap = new Map<number, CorridorOrder>();
           for (const o of prev.corridorOrders) orderMap.set(o.orderId, o);
           for (const o of data.corridorOrders) orderMap.set(o.orderId, o);
@@ -356,6 +635,37 @@ export default function App() {
           };
         });
       } catch (err) {
+        // Serverless / static fallback: fetch Fuzzwork aggregates directly from the browser
+        try {
+          const trackedTypeIds = getItemsForCategories(cats).map((i) => i.typeId);
+          const direct = await fetchHubQuotesDirect(
+            uniqueHubs,
+            trackedTypeIds,
+            snapshotRef.current.quotes
+          );
+          if (direct.quotes && Object.keys(direct.quotes).length > 0) {
+            setSnapshot((prev) => {
+              const mergedQuotes: Record<number, MarketQuote> = {
+                ...prev.quotes,
+                ...direct.quotes,
+              };
+              const liveItemCount = Object.values(mergedQuotes).filter(
+                (q) => q.source === 'live'
+              ).length;
+              return {
+                ...prev,
+                quotes: mergedQuotes,
+                liveItemCount,
+                lastSyncedAt: direct.lastSyncedAt ?? new Date().toISOString(),
+                sourceMode: liveItemCount > 0 ? 'live' : prev.sourceMode,
+                syncError: null,
+              };
+            });
+            return;
+          }
+        } catch {
+          // Fall through to warning state
+        }
         const message =
           err instanceof Error ? err.message : 'Unable to reach market proxy.';
         setSnapshot((prev) => ({
@@ -563,13 +873,13 @@ export default function App() {
     }
   }, [catalogCooldownRemainingSec, isCatalogLoading, rateLimitPauseRemainingSec]);
 
-  // Initial sync & re-sync whenever checked categories change (debounced slightly)
+  // Initial sync & re-sync whenever checked categories or 5-hub trade pair change
   useEffect(() => {
     const timer = setTimeout(() => {
-      syncLiveMarkets(checkedCategories, false);
+      syncLiveMarkets(checkedCategories, false, [sourceHub, destHub]);
     }, 180);
     return () => clearTimeout(timer);
-  }, [checkedCategories, syncLiveMarkets]);
+  }, [checkedCategories, sourceHub, destHub, syncLiveMarkets]);
 
   // Listen for EVE SSO popup callback postMessage
   useEffect(() => {
@@ -669,6 +979,15 @@ export default function App() {
             : prev.activeOrders,
           activeOrdersSyncedAt:
             charJson.activeOrdersSyncedAt ?? prev.activeOrdersSyncedAt,
+          industryJobs: Array.isArray(charJson.industryJobs)
+            ? charJson.industryJobs
+            : prev.industryJobs,
+          industryJobsSyncedAt:
+            charJson.industryJobsSyncedAt ?? prev.industryJobsSyncedAt,
+          hangarStock:
+            charJson.hangarStock && Object.keys(charJson.hangarStock).length > 0
+              ? charJson.hangarStock
+              : prev.hangarStock,
           hulls:
             charJson.hulls && charJson.hulls.length > 0 ? charJson.hulls : prev.hulls,
         }));
@@ -693,19 +1012,30 @@ export default function App() {
   }, []);
 
   const handleChangeClientId = (val: string) => {
-    setEveClientId(val);
-    try {
-      localStorage.setItem('new_eden_eve_client_id', val);
-    } catch {
-      // ignore storage errors
-    }
+    setCustomEveClientId(val);
+    saveCustomEveClientId(val);
   };
 
-  const handleConnectEveSso = async () => {
-    const trimmedId = eveClientId.trim();
+  const handleSaveApiKeys = (keys: { eveClientId: string; geminiApiKey: string }) => {
+    setCustomEveClientId(keys.eveClientId);
+    saveCustomEveClientId(keys.eveClientId);
+    setCustomGeminiKey(keys.geminiApiKey);
+    saveCustomGeminiKey(keys.geminiApiKey);
+    setApiSetupReason(null);
+  };
+
+  const handleConnectEveSso = async (overrideClientId?: string) => {
+    const trimmedId = (
+      envEveClientId ||
+      (overrideClientId !== undefined ? overrideClientId : customEveClientId)
+    ).trim();
+
     if (!trimmedId) {
-      setSettingsOpen(true);
-      setSsoStatusMsg('Enter your EVE Developer Application CLIENT_ID first.');
+      setSettingsOpen(false);
+      openApiSetupModal(
+        'No EVE Client ID is configured yet. Copy the Callback URL below into developers.eveonline.com, paste your Client ID, and click Save & Connect EVE SSO.'
+      );
+      setSsoStatusMsg('Configure your EVE Developer Application Client ID in API Setup first.');
       return;
     }
 
@@ -735,6 +1065,12 @@ export default function App() {
         err instanceof Error ? err.message : 'Unable to start PKCE authentication.'
       );
     }
+  };
+
+  const handleSaveAndConnectSso = (keys: { eveClientId: string; geminiApiKey: string }) => {
+    handleSaveApiKeys(keys);
+    setApiSetupOpen(false);
+    void handleConnectEveSso(keys.eveClientId);
   };
 
   const handleSwitchToSimulation = () => {
@@ -852,14 +1188,102 @@ export default function App() {
     [profile.activeOrders]
   );
 
+  // Live refresh of active character industry jobs (esi-industry.read_character_jobs.v1)
+  const handleRefreshIndustryJobs = useCallback(async () => {
+    if (profile.mode !== 'eve_sso' || !eveAccessToken || !profile.characterId) {
+      return;
+    }
+    setIsRefreshingJobs(true);
+    setJobsError(null);
+    try {
+      const jobs = await fetchCharacterIndustryJobsClient(profile.characterId, eveAccessToken);
+      setProfile((prev) => ({
+        ...prev,
+        industryJobs: jobs,
+        industryJobsSyncedAt: new Date().toISOString(),
+      }));
+    } catch (err) {
+      setJobsError(
+        err instanceof Error ? err.message : 'Unable to fetch active character industry jobs.'
+      );
+    } finally {
+      setIsRefreshingJobs(false);
+    }
+  }, [eveAccessToken, profile.characterId, profile.mode]);
+
+  // Live Undercut & Fill Order Monitor scan
+  const handleRefreshOrderMonitor = useCallback(async () => {
+    if (profile.mode !== 'eve_sso' || !eveAccessToken || !profile.characterId) {
+      return;
+    }
+    setIsRefreshingOrderMonitor(true);
+    setOrderMonitorError(null);
+    try {
+      const data = await fetchOrderMonitorClient(
+        profile.characterId,
+        eveAccessToken,
+        effectiveFees.salesTaxPct / 100
+      );
+      setOrderMonitorData(data);
+    } catch (err) {
+      setOrderMonitorError(
+        err instanceof Error ? err.message : 'Unable to scan live order books for undercuts.'
+      );
+    } finally {
+      setIsRefreshingOrderMonitor(false);
+    }
+  }, [effectiveFees.salesTaxPct, eveAccessToken, profile.characterId, profile.mode]);
+
+  // Open Market Details window inside the active EVE Online client (Express proxy + direct ESI fallback)
+  const handleOpenEveMarketWindow = useCallback(
+    async (typeId: number) => {
+      if (!eveAccessToken) return;
+      try {
+        const res = await fetch('/api/eve/open-market', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${eveAccessToken}`,
+          },
+          body: JSON.stringify({ typeId }),
+        });
+        if (res.ok) return;
+      } catch {
+        // Fallback to direct ESI UI trigger
+      }
+      await fetch(
+        `https://esi.evetech.net/latest/ui/openwindow/marketdetails/?datasource=tranquility&type_id=${typeId}`,
+        {
+          method: 'POST',
+          headers: { Authorization: `Bearer ${eveAccessToken}` },
+        }
+      );
+    },
+    [eveAccessToken]
+  );
+
   // Run all 5 deterministic decision engines reactively
   const engineBundle = useMemo(
     () =>
       runAllDecisionEngines(checkedCategories, snapshot, profile, {
         catalog,
         minDailyVolume,
+        sourceHub,
+        destHub,
+        structureConfig,
+        industryCosts: industryCosts ?? undefined,
       }),
-    [checkedCategories, snapshot, profile, catalog, minDailyVolume]
+    [
+      checkedCategories,
+      snapshot,
+      profile,
+      catalog,
+      minDailyVolume,
+      sourceHub,
+      destHub,
+      structureConfig,
+      industryCosts,
+    ]
   );
 
   // Merge engine-generated Jita shopping list with any items added via Gemini Advisor actions
@@ -991,7 +1415,7 @@ export default function App() {
       case 'corridor_trade':
       case 'pipeline_corridor':
       case 'regional_trade':
-        return 'Jita–Dodixie';
+        return '5-Hub Trade';
       case 'pi_factory':
         return 'PI Factories';
       default:
@@ -1145,9 +1569,13 @@ export default function App() {
 
     try {
       const appStateSummary = buildAppStateSummary();
+      const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+      if (!hasEnvGeminiKey && customGeminiKey.trim()) {
+        headers['X-Gemini-Api-Key'] = customGeminiKey.trim();
+      }
       const res = await fetch('/api/advisor/chat', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers,
         body: JSON.stringify({
           messages: nextHistory.map((m) => ({ role: m.role, content: m.content })),
           checkedCategories,
@@ -1210,14 +1638,40 @@ export default function App() {
       })
     : 'Syncing...';
 
+  const dynamicSections = useMemo(() => {
+    const srcLabel = EMPIRE_HUB_MAP[sourceHub].shortLabel;
+    const dstLabel = EMPIRE_HUB_MAP[destHub].shortLabel;
+    const structLabel =
+      structureConfig.structureType === 'npc_station'
+        ? 'NPC Station'
+        : structureConfig.structureType.toUpperCase();
+    return ENGINE_SECTIONS.map((sec) => {
+      if (sec.id === 'indy_invention') {
+        return {
+          ...sec,
+          title: `${structureConfig.systemName} Industry & T2 Copy / Invention Planner`,
+          subtitle: `Live CCP cost indices (${structureConfig.systemName} · ${structLabel}) + Upwell rig bonuses & vanilla T2 invention.`,
+        };
+      }
+      if (sec.id === 'regional_trade') {
+        return {
+          ...sec,
+          title: `5-Hub Regional Trade Manifesto (${srcLabel} <-> ${dstLabel})`,
+          subtitle: `Ranked outbound & backhaul manifests across ${srcLabel} and ${dstLabel}, capped by ISK float, hull m³, and live book depth.`,
+        };
+      }
+      return sec;
+    });
+  }, [destHub, sourceHub, structureConfig.structureType, structureConfig.systemName]);
+
   const sectionsToRender =
     activeView === 'overview'
-      ? ENGINE_SECTIONS
+      ? dynamicSections
       : activeView === 'corridor_trade'
-        ? ENGINE_SECTIONS.filter(
+        ? dynamicSections.filter(
             (s) => s.id === 'pipeline_corridor' || s.id === 'regional_trade'
           )
-        : ENGINE_SECTIONS.filter((s) => s.id === activeView);
+        : dynamicSections.filter((s) => s.id === activeView);
 
   // Active cards currently visible in the main workspace (for "Select All Visible")
   const visibleCardsList = useMemo(() => {
@@ -1272,12 +1726,38 @@ export default function App() {
     setRightSidebarMode('route');
   }, []);
 
+  const handleToggleCollapseAllCards = useCallback(() => {
+    const nextCollapsed = !allCardsCollapsed;
+    const keys = [
+      'panel-command-summary',
+      'panel-industry-facility',
+      'panel-industry-jobs',
+      'panel-watchlist',
+      'panel-overview-profit-chart',
+      'panel-5hub-chart',
+      'panel-blueprint-library',
+      ...visibleCardsList.map((c) => `card-${c.id}`),
+    ];
+    setManyCardsCollapsed(keys, nextCollapsed);
+    setAllCardsCollapsed(nextCollapsed);
+  }, [allCardsCollapsed, visibleCardsList]);
+
+  const handleOpenOrderMonitor = useCallback(() => {
+    setOrderMonitorOpen(true);
+    if (profile.mode === 'eve_sso' && !orderMonitorData && !isRefreshingOrderMonitor) {
+      void handleRefreshOrderMonitor();
+    }
+  }, [handleRefreshOrderMonitor, isRefreshingOrderMonitor, orderMonitorData, profile.mode]);
+
   return (
     <div className="min-h-screen lg:h-screen flex flex-col bg-[#0b0e14] text-slate-100 lg:overflow-hidden">
       {/* Strict 3-Zone Top Navigation Bar */}
       <TopBar
         activeView={activeView}
         onSelectView={setActiveView}
+        orderMonitorOpen={orderMonitorOpen}
+        undercutCount={profile.mode === 'eve_sso' ? (orderMonitorData?.undercutCount ?? 0) : 2}
+        onOpenOrderMonitor={handleOpenOrderMonitor}
         onSyncMarkets={handleRefreshMarketPrices}
         isSyncing={isSyncing || scanProgress.active}
         marketCooldownRemainingSec={marketCooldownRemainingSec}
@@ -1287,6 +1767,8 @@ export default function App() {
         onToggleRoutePanel={() =>
           setRightSidebarMode((mode) => (mode === 'route' ? 'collapsed' : 'route'))
         }
+        onOpenApiSetup={() => openApiSetupModal(null)}
+        hasEveClientId={Boolean(effectiveEveClientId)}
       />
 
       {/* Main Split Command Workspace (Center Workspace + Right Docked AI Sidebar) */}
@@ -1359,7 +1841,17 @@ export default function App() {
 
               <button
                 type="button"
-                onClick={() => openSettingsTab('sso')}
+                onClick={() => {
+                  if (profile.mode === 'eve_sso') {
+                    openSettingsTab('sso');
+                  } else if (!effectiveEveClientId) {
+                    openApiSetupModal(
+                      'No EVE Client ID is configured yet. Copy the Callback URL below into developers.eveonline.com, paste your Client ID, and click Save & Connect EVE SSO.'
+                    );
+                  } else {
+                    void handleConnectEveSso();
+                  }
+                }}
                 className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-md border border-cyan-500/35 bg-cyan-500/10 text-cyan-200 hover:bg-cyan-500/20 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
               >
                 <KeyRound className="w-3.5 h-3.5" aria-hidden="true" />
@@ -1436,7 +1928,7 @@ export default function App() {
             onToggleCategory={handleToggleCategory}
             onApplyPreset={handleApplyPreset}
             isExpanded={scopeExpanded}
-            onToggleExpand={() => setScopeExpanded((v) => !v)}
+            onToggleExpand={toggleScopeCollapsed}
             activeTrackedItemCount={engineBundle.activeTrackedItemCount}
             catalog={catalog}
             isCatalogLoading={isCatalogLoading}
@@ -1455,74 +1947,106 @@ export default function App() {
             onChangeMinDailyVolume={setMinDailyVolume}
           />
 
-          {/* 5-Column Command Telemetry Strip (Single-Elevation Hairline Bar) */}
+          {/* Collapsible 5-Column Command Telemetry Strip */}
           <section
             aria-label="Command Summary Metrics"
-            className="grid grid-cols-2 md:grid-cols-3 xl:grid-cols-5 bg-[#131822] border border-slate-800/90 rounded-lg divide-y xl:divide-y-0 md:divide-x divide-slate-800/80"
+            className="bg-[#131822] border border-slate-800/90 rounded-lg overflow-hidden"
           >
-            <div className="p-4">
-              <div className="text-xs text-slate-400">Top Ranked Opportunity</div>
-              <div className="font-mono tabular-nums text-lg font-semibold text-emerald-400 mt-1">
-                {topActionCard ? `+${formatIsk(topActionCard.netProfitIsk)}` : '—'}
-              </div>
-              <div className="text-[11px] text-slate-400 mt-0.5 truncate" title={topActionCard?.title}>
-                {topActionCard
-                  ? `${topActionCard.title} (${formatPct(topActionCard.roiPct)})`
-                  : 'Select at least one category'}
-              </div>
-            </div>
-
-            <div
-              className="p-4"
-              title={`Cumulative net profit if all ${selectedTotals.profitableCardCount} profitable selected opportunities are completed (${formatIsk(selectedTotals.totalRequiredCapitalIsk)} combined capital, ${formatM3(selectedTotals.totalCargoVolumeM3)} total cargo).`}
-            >
-              <div className="text-xs text-slate-400">Total Profit (All Selected)</div>
-              <div className="font-mono tabular-nums text-lg font-semibold text-emerald-300 mt-1">
-                {selectedTotals.profitableCardCount > 0
-                  ? `+${formatIsk(selectedTotals.totalProjectedProfitIsk)}`
-                  : '—'}
-              </div>
-              <div className="text-[11px] text-slate-400 font-mono tabular-nums mt-0.5 truncate">
-                {selectedTotals.totalCardCount === 0
-                  ? 'Select categories above'
-                  : selectedTotals.profitableCardCount === selectedTotals.totalCardCount
-                    ? `All ${selectedTotals.totalCardCount} cards · ${formatPct(selectedTotals.blendedRoiPct)} ROI`
-                    : `${selectedTotals.profitableCardCount} of ${selectedTotals.totalCardCount} profitable · ${formatPct(selectedTotals.blendedRoiPct)}`}
-              </div>
-            </div>
-
-            <div className="p-4">
-              <div className="text-xs text-slate-400">Consolidated Jita Shopping List</div>
-              <div className="font-mono tabular-nums text-lg font-semibold text-amber-300 mt-1">
-                {formatIsk(mergedShopping.totalIsk)}
-              </div>
-              <div className="text-[11px] text-slate-400 font-mono tabular-nums mt-0.5 truncate">
-                {formatM3(mergedShopping.totalM3)} · 1j savings{' '}
-                <span className="text-emerald-400">
-                  {formatIsk(mergedShopping.savingsIsk)}
+            <div className="px-4 py-2 border-b border-slate-800/80 bg-[#0e131b]/70 flex items-center justify-between gap-2">
+              <div className="flex flex-wrap items-center gap-2 text-xs">
+                <span className="font-display font-semibold text-slate-200">
+                  Command Telemetry Summary
                 </span>
+                {summaryCollapsed && topActionCard && (
+                  <span className="font-mono tabular-nums text-[11px] text-emerald-400">
+                    Top +{formatIsk(topActionCard.netProfitIsk)} · Total +
+                    {formatIsk(selectedTotals.totalProjectedProfitIsk)} ·{' '}
+                    {engineBundle.cards.length} cards
+                  </span>
+                )}
               </div>
+              <button
+                type="button"
+                onClick={toggleSummaryCollapsed}
+                aria-expanded={!summaryCollapsed}
+                aria-label={summaryCollapsed ? 'Expand Command Summary' : 'Collapse Command Summary'}
+                className="p-1 rounded border border-slate-700/80 bg-[#0b0e14] text-slate-400 hover:text-slate-100 hover:border-slate-600 transition-colors cursor-pointer"
+              >
+                {summaryCollapsed ? (
+                  <ChevronDown className="w-3.5 h-3.5" aria-hidden="true" />
+                ) : (
+                  <ChevronUp className="w-3.5 h-3.5" aria-hidden="true" />
+                )}
+              </button>
             </div>
 
-            <div className="p-4">
-              <div className="text-xs text-slate-400">Active Scope &amp; Action Cards</div>
-              <div className="font-mono tabular-nums text-lg font-semibold text-slate-100 mt-1">
-                {engineBundle.cards.length} Cards
-              </div>
-              <div className="text-[11px] text-slate-400 font-mono tabular-nums mt-0.5 truncate">
-                {engineBundle.activeTrackedItemCount} tracked SKUs · {snapshot.liveItemCount} live
-              </div>
-            </div>
+            {!summaryCollapsed && (
+              <div className="grid grid-cols-2 md:grid-cols-3 xl:grid-cols-5 divide-y xl:divide-y-0 md:divide-x divide-slate-800/80">
+                <div className="p-4">
+                  <div className="text-xs text-slate-400">Top Ranked Opportunity</div>
+                  <div className="font-mono tabular-nums text-lg font-semibold text-emerald-400 mt-1">
+                    {topActionCard ? `+${formatIsk(topActionCard.netProfitIsk)}` : '—'}
+                  </div>
+                  <div className="text-[11px] text-slate-400 mt-0.5 truncate" title={topActionCard?.title}>
+                    {topActionCard
+                      ? `${topActionCard.title} (${formatPct(topActionCard.roiPct)})`
+                      : 'Select at least one category'}
+                  </div>
+                </div>
 
-            <div className="p-4 col-span-2 md:col-span-1">
-              <div className="text-xs text-slate-400">Ishisomo Hangar Fleet</div>
-              <div className="font-mono tabular-nums text-lg font-semibold text-cyan-300 mt-1">
-                {profile.hulls.length} Hulls Ready
+                <div
+                  className="p-4"
+                  title={`Cumulative net profit if all ${selectedTotals.profitableCardCount} profitable selected opportunities are completed (${formatIsk(selectedTotals.totalRequiredCapitalIsk)} combined capital, ${formatM3(selectedTotals.totalCargoVolumeM3)} total cargo).`}
+                >
+                  <div className="text-xs text-slate-400">Total Profit (All Selected)</div>
+                  <div className="font-mono tabular-nums text-lg font-semibold text-emerald-300 mt-1">
+                    {selectedTotals.profitableCardCount > 0
+                      ? `+${formatIsk(selectedTotals.totalProjectedProfitIsk)}`
+                      : '—'}
+                  </div>
+                  <div className="text-[11px] text-slate-400 font-mono tabular-nums mt-0.5 truncate">
+                    {selectedTotals.totalCardCount === 0
+                      ? 'Select categories above'
+                      : selectedTotals.profitableCardCount === selectedTotals.totalCardCount
+                        ? `All ${selectedTotals.totalCardCount} cards · ${formatPct(selectedTotals.blendedRoiPct)} ROI`
+                        : `${selectedTotals.profitableCardCount} of ${selectedTotals.totalCardCount} profitable · ${formatPct(selectedTotals.blendedRoiPct)}`}
+                  </div>
+                </div>
+
+                <div className="p-4">
+                  <div className="text-xs text-slate-400">Consolidated Jita Shopping List</div>
+                  <div className="font-mono tabular-nums text-lg font-semibold text-amber-300 mt-1">
+                    {formatIsk(mergedShopping.totalIsk)}
+                  </div>
+                  <div className="text-[11px] text-slate-400 font-mono tabular-nums mt-0.5 truncate">
+                    {formatM3(mergedShopping.totalM3)} · 1j savings{' '}
+                    <span className="text-emerald-400">
+                      {formatIsk(mergedShopping.savingsIsk)}
+                    </span>
+                  </div>
+                </div>
+
+                <div className="p-4">
+                  <div className="text-xs text-slate-400">Active Scope &amp; Action Cards</div>
+                  <div className="font-mono tabular-nums text-lg font-semibold text-slate-100 mt-1">
+                    {engineBundle.cards.length} Cards
+                  </div>
+                  <div className="text-[11px] text-slate-400 font-mono tabular-nums mt-0.5 truncate">
+                    {engineBundle.activeTrackedItemCount} tracked SKUs · {snapshot.liveItemCount} live
+                  </div>
+                </div>
+
+                <div className="p-4 col-span-2 md:col-span-1">
+                  <div className="text-xs text-slate-400">Ishisomo Hangar Fleet</div>
+                  <div className="font-mono tabular-nums text-lg font-semibold text-cyan-300 mt-1">
+                    {profile.hulls.length} Hulls Ready
+                  </div>
+                  <div className="text-[11px] text-slate-400 font-mono tabular-nums mt-0.5 truncate">
+                    BR 10.2k · DST 62.5k · Orca 187.5k m³
+                  </div>
+                </div>
               </div>
-              <div className="text-[11px] text-slate-400 font-mono tabular-nums mt-0.5 truncate">
-                BR 10.2k · DST 62.5k · Orca 187.5k m³
-              </div>
-            </div>
+            )}
           </section>
 
           {/* Compact Route Queue Control Bar */}
@@ -1610,6 +2134,20 @@ export default function App() {
                   <span>Clear Route</span>
                 </button>
 
+                <button
+                  type="button"
+                  onClick={handleToggleCollapseAllCards}
+                  title="Collapse or expand all dashboard panels and action cards (saved across refreshes)"
+                  className="inline-flex items-center gap-1.5 px-2.5 py-1.5 text-xs font-medium rounded border border-slate-700/90 bg-[#0e131b] text-slate-300 hover:border-slate-500 hover:text-slate-100 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+                >
+                  {allCardsCollapsed ? (
+                    <ChevronsUpDown className="w-3.5 h-3.5 text-cyan-400" aria-hidden="true" />
+                  ) : (
+                    <ChevronsDownUp className="w-3.5 h-3.5 text-slate-400" aria-hidden="true" />
+                  )}
+                  <span>{allCardsCollapsed ? 'Expand All' : 'Collapse All'}</span>
+                </button>
+
                 {rightSidebarMode !== 'route' && (
                   <button
                     type="button"
@@ -1643,6 +2181,49 @@ export default function App() {
           ) : (
             /* Market Visualizations + 5 Decision Engine Action Card Sections */
             <div className="space-y-8 pb-8">
+              {(activeView === 'overview' || activeView === 'indy_invention') && (
+                <IndustryFacilityBar
+                  config={structureConfig}
+                  industryCosts={industryCosts}
+                  isRefreshingCosts={isRefreshingCosts}
+                  onChangeConfig={handleChangeStructureConfig}
+                  onRefreshCosts={() => void handleRefreshIndustryCosts()}
+                />
+              )}
+
+              {(activeView === 'overview' || activeView === 'indy_invention') && (
+                <IndustryJobsPanel
+                  profile={profile}
+                  indyCards={visibleCardsByEngine.indy_invention}
+                  queuedRouteCardIds={queuedRouteIds}
+                  isRefreshingJobs={isRefreshingJobs}
+                  jobsError={jobsError}
+                  onRefreshJobs={() => void handleRefreshIndustryJobs()}
+                  onInspectCard={(c) => {
+                    setShowShoppingListDrawer(false);
+                    setInspectedCard(c);
+                  }}
+                  onAddToRoute={(cardId) => handleToggleQueueCard(cardId, true)}
+                />
+              )}
+
+              {(activeView === 'overview' ||
+                activeView === 'corridor_trade' ||
+                activeView === 'regional_trade') && (
+                <WatchlistPanel
+                  watchlist={watchlist}
+                  snapshot={snapshot}
+                  profile={profile}
+                  catalog={catalog}
+                  sourceHub={sourceHub}
+                  destHub={destHub}
+                  onAddWatchlistItem={handleAddWatchlistItem}
+                  onUpdateWatchlistItem={handleUpdateWatchlistItem}
+                  onRemoveWatchlistItem={handleRemoveWatchlistItem}
+                  onOpenHistory={handleOpenHistory}
+                />
+              )}
+
               {activeView === 'overview' && engineBundle.cards.length > 0 && (
                 <OverviewProfitChart
                   cards={engineBundle.cards}
@@ -1661,6 +2242,11 @@ export default function App() {
                   profile={profile}
                   catalog={catalog}
                   minDailyVolume={minDailyVolume}
+                  sourceHub={sourceHub}
+                  destHub={destHub}
+                  onChangeSourceHub={handleChangeSourceHub}
+                  onChangeDestHub={handleChangeDestHub}
+                  onSwapHubs={handleSwapHubs}
                   onOpenHistory={handleOpenHistory}
                 />
               )}
@@ -1719,7 +2305,13 @@ export default function App() {
                             profile={profile}
                             eveAccessToken={eveAccessToken}
                             isQueuedForRoute={queuedRouteIds.includes(card.id)}
+                            isPinnedToWatchlist={
+                              card.primaryTypeId
+                                ? pinnedTypeIds.has(card.primaryTypeId)
+                                : false
+                            }
                             onToggleQueueForRoute={handleToggleQueueCard}
+                            onTogglePinWatchlist={handleTogglePinWatchlist}
                             onChangeExecutionMode={handleChangeExecutionMode}
                             onInspect={(c) => {
                               setShowShoppingListDrawer(false);
@@ -1746,6 +2338,8 @@ export default function App() {
                     includeCorpBlueprints={includeCorpBlueprints}
                     isScanning={isScanningBlueprints}
                     scanError={blueprintScanError}
+                    pinnedTypeIds={pinnedTypeIds}
+                    onTogglePinWatchlist={handleTogglePinWatchlist}
                     onToggleCorpBlueprints={handleToggleCorpBlueprints}
                     onRescanBlueprints={() => handleScanBlueprints(includeCorpBlueprints)}
                     onOpenHistory={handleOpenHistory}
@@ -1816,6 +2410,8 @@ export default function App() {
         shoppingTotalIsk={mergedShopping.totalIsk}
         shoppingTotalM3={mergedShopping.totalM3}
         shoppingSavingsIsk={mergedShopping.savingsIsk}
+        deductHangarStock={deductHangarStock}
+        onToggleDeductHangarStock={handleToggleDeductHangarStock}
         customItemCount={customShoppingItems.length}
         onClearCustomShoppingItems={() => {
           setCustomShoppingItems([]);
@@ -1826,6 +2422,29 @@ export default function App() {
         onClose={() => {
           setInspectedCard(null);
           setShowShoppingListDrawer(false);
+        }}
+      />
+
+      {/* Slide-Over Undercut & Realized Fill Order Monitor Overlay */}
+      <OrderMonitorOverlay
+        isOpen={orderMonitorOpen}
+        onClose={() => setOrderMonitorOpen(false)}
+        profile={profile}
+        eveAccessToken={eveAccessToken}
+        data={orderMonitorData}
+        isLoading={isRefreshingOrderMonitor}
+        error={orderMonitorError}
+        onRefresh={() => void handleRefreshOrderMonitor()}
+        onOpenEveMarketWindow={handleOpenEveMarketWindow}
+        onOpenSsoSetup={() => {
+          setOrderMonitorOpen(false);
+          if (!effectiveEveClientId) {
+            openApiSetupModal(
+              'Configure your EVE Client ID below to connect EVE SSO and monitor live undercuts and wallet fills.'
+            );
+          } else {
+            openSettingsTab('sso');
+          }
         }}
       />
 
@@ -1851,6 +2470,47 @@ export default function App() {
         onClose={() => setHistoryTarget(null)}
       />
 
+      {/* Subtle Bottom Footer Bar with Semantic Version Pill */}
+      <footer className="px-5 py-1.5 bg-[#0d1118] border-t border-slate-800/80 flex items-center justify-between gap-4 text-[11px] text-slate-500 shrink-0">
+        <div className="flex items-center gap-2 min-w-0">
+          <span className="truncate">Foxy RedFox Indy Command</span>
+          <span aria-hidden="true">·</span>
+          <button
+            type="button"
+            onClick={() => openApiSetupModal(null)}
+            className="text-slate-400 hover:text-cyan-300 transition-colors cursor-pointer whitespace-nowrap"
+          >
+            API Setup
+          </button>
+        </div>
+        <span
+          title={`Foxy RedFox Indy Command version ${__APP_VERSION__}`}
+          className="px-2 py-0.5 rounded-full bg-slate-900 border border-slate-800 font-mono text-[10px] text-slate-400 tabular-nums shrink-0"
+        >
+          v{__APP_VERSION__}
+        </span>
+      </footer>
+
+      {/* Zero-Terminal "Bring Your Own Keys" API Setup Modal */}
+      <ApiSetupModal
+        isOpen={apiSetupOpen}
+        onClose={() => {
+          setApiSetupOpen(false);
+          setApiSetupReason(null);
+        }}
+        callbackUrl={callbackUrl}
+        hasEnvEveClientId={hasEnvEveClientId}
+        envEveClientId={envEveClientId}
+        customEveClientId={customEveClientId}
+        hasEnvGeminiKey={hasEnvGeminiKey}
+        customGeminiKey={customGeminiKey}
+        autoOpenedReason={apiSetupReason}
+        isSsoConnected={profile.mode === 'eve_sso'}
+        isSsoConnecting={isSsoConnecting}
+        onSaveKeys={handleSaveApiKeys}
+        onSaveAndConnectSso={handleSaveAndConnectSso}
+      />
+
       {/* EVE SSO & Pilot Profile Settings Modal */}
       <SettingsModal
         isOpen={settingsOpen}
@@ -1858,10 +2518,10 @@ export default function App() {
         onClose={() => setSettingsOpen(false)}
         profile={profile}
         onUpdateProfile={setProfile}
-        eveClientId={eveClientId}
+        eveClientId={effectiveEveClientId}
         onChangeEveClientId={handleChangeClientId}
         callbackUrl={callbackUrl}
-        onConnectEveSso={handleConnectEveSso}
+        onConnectEveSso={() => void handleConnectEveSso()}
         onSwitchToSimulation={handleSwitchToSimulation}
         ssoStatusMsg={ssoStatusMsg}
         isSsoConnecting={isSsoConnecting}

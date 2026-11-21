@@ -77,10 +77,27 @@ export interface CorridorOrder {
   locationId: number;
 }
 
+export type TradeHubId = 'jita' | 'amarr' | 'dodixie' | 'rens' | 'hek';
+
+export interface EmpireHubDef {
+  id: TradeHubId;
+  shortName: string;
+  shortLabel: string;
+  systemId: number;
+  systemName: string;
+  stationId: number;
+  stationName: string;
+  regionId: number;
+  regionName: string;
+  priceMultiplierFallback: number;
+  volMultiplierFallback: number;
+}
+
 export interface MarketQuote {
   typeId: number;
   jita: HubQuote;
   dodixie: HubQuote;
+  hubs?: Partial<Record<TradeHubId, HubQuote>>;
   estDailyJitaVol?: number;
   estDailyDodixieVol?: number;
   oneJumpCheapestSell?: {
@@ -249,6 +266,116 @@ export interface ActiveOrderConflict {
   price: number;
 }
 
+export type IndustryStructureType = 'npc_station' | 'raitaru' | 'azbel' | 'sotiyo';
+export type RigTier = 'none' | 't1' | 't2';
+
+export interface IndustryStructureConfig {
+  systemId: number;
+  systemName: string;
+  structureType: IndustryStructureType;
+  meRig: RigTier;
+  teRig: RigTier;
+  costRig: RigTier;
+  facilityTaxPct: number;
+}
+
+export interface SystemCostIndices {
+  systemId: number;
+  manufacturing: number;
+  invention: number;
+  copying: number;
+  researching_material_efficiency: number;
+  researching_time_efficiency: number;
+  reaction: number;
+}
+
+export interface IndustryCostSnapshot {
+  costIndicesBySystem: Record<number, SystemCostIndices>;
+  adjustedPricesByType: Record<number, number>;
+  fetchedAt: string | null;
+  source: 'esi_live' | 'baseline';
+}
+
+export interface CharacterIndustryJob {
+  jobId: number;
+  activityId: number; // 1=Manufacturing, 3=TE, 4=ME, 5=Copying, 8=Invention, 9/11=Reaction
+  activityLabel: string;
+  blueprintId?: number;
+  blueprintTypeId: number;
+  blueprintName: string;
+  productTypeId?: number;
+  productName: string;
+  runs: number;
+  cost?: number;
+  costIsk?: number;
+  durationSeconds?: number;
+  facilityId: number;
+  facilityName: string;
+  status: string;
+  startDate: string;
+  endDate: string;
+}
+
+export interface HangarStockEntry {
+  typeId: number;
+  jita: number;
+  ishisomo: number;
+  total: number;
+}
+
+export interface OrderMonitorEntry {
+  orderId: number;
+  typeId: number;
+  itemName: string;
+  regionId: number;
+  regionName: string;
+  locationId: number;
+  stationName: string;
+  isBuyOrder: boolean;
+  myPrice: number;
+  marketBestPrice: number;
+  isUndercut: boolean;
+  suggestedReclaimPrice: number;
+  deltaIsk: number;
+  competitorsAhead: number;
+  volumeRemain: number;
+  volumeTotal: number;
+  issued: string;
+}
+
+export interface WalletTransactionEntry {
+  transactionId: number;
+  date: string;
+  typeId: number;
+  itemName: string;
+  isBuy: boolean;
+  quantity: number;
+  unitPrice: number;
+  totalIsk: number;
+  locationId: number;
+}
+
+export interface OrderMonitorSnapshot {
+  orders: OrderMonitorEntry[];
+  undercutCount: number;
+  recentTransactions: WalletTransactionEntry[];
+  realizedRevenue24hIsk: number;
+  realizedSpend24hIsk: number;
+  realizedProfit24hIsk: number;
+  realizedProfit7dIsk: number;
+  syncedAt: string;
+}
+
+export interface WatchlistItem {
+  id: string;
+  typeId: number;
+  name: string;
+  kind: 'sku' | 'blueprint';
+  minRoiPct: number;
+  minIskPerM3: number;
+  pinnedAt: string;
+}
+
 export interface PilotProfile {
   mode: 'simulation' | 'eve_sso';
   characterId?: number;
@@ -272,6 +399,10 @@ export interface PilotProfile {
     scrapmetalProcessing: number; // 5
     industry: number; // 5
     scienceEncryption: number; // 5
+    massProduction?: number; // 3387: +1 mfg slot/lvl
+    advancedMassProduction?: number; // 24625: +1 mfg slot/lvl
+    laboratoryOperation?: number; // 3406: +1 science slot/lvl
+    advancedLaboratoryOperation?: number; // 24624: +1 science slot/lvl
   };
   haulingSkills?: Record<number, number>; // Real EVE hauling skill levels keyed by skill type_id
   pocoImportTaxPct: number; // Default 10%
@@ -281,6 +412,9 @@ export interface PilotProfile {
   blueprintSyncMeta?: BlueprintSyncMeta;
   activeOrders?: ActiveMarketOrder[];
   activeOrdersSyncedAt?: string;
+  industryJobs?: CharacterIndustryJob[];
+  industryJobsSyncedAt?: string;
+  hangarStock?: Record<number, HangarStockEntry>;
 }
 
 export type EngineId =

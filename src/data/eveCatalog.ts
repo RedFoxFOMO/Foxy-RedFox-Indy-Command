@@ -1,8 +1,11 @@
 import type {
+  EmpireHubDef,
   EveItem,
+  IndustryStructureConfig,
   MarketCategoryDef,
   MarketCategoryId,
   PilotProfile,
+  TradeHubId,
 } from '../types/eve.ts';
 
 // --- Canonical New Eden Stations, Regions, and Systems ---
@@ -13,10 +16,25 @@ export const EVE_ANCHORS = {
   JITA_SYSTEM_ID: 30000142,
   THE_FORGE_REGION_ID: 10000002,
 
+  AMARR_STATION_ID: 60008494,
+  AMARR_STATION_NAME: 'Amarr VIII (Oris) - Emperor Family Academy',
+  AMARR_SYSTEM_ID: 30002187,
+  DOMAIN_REGION_ID: 10000043,
+
   DODIXIE_STATION_ID: 60011866,
   DODIXIE_STATION_NAME: 'Dodixie IX - Moon 20 - Federation Navy Assembly Plant',
   DODIXIE_SYSTEM_ID: 30002659,
   SINQ_LAISON_REGION_ID: 10000032,
+
+  RENS_STATION_ID: 60004588,
+  RENS_STATION_NAME: 'Rens VI - Moon 8 - Brutor Tribe Treasury',
+  RENS_SYSTEM_ID: 30002510,
+  HEIMATAR_REGION_ID: 10000030,
+
+  HEK_STATION_ID: 60005686,
+  HEK_STATION_NAME: 'Hek VIII - Moon 12 - Boundless Creation Factory',
+  HEK_SYSTEM_ID: 30002053,
+  METROPOLIS_REGION_ID: 10000042,
 
   ISHISOMO_SYSTEM_ID: 30000137,
   ISHISOMO_SYSTEM_NAME: 'Ishisomo',
@@ -25,6 +43,99 @@ export const EVE_ANCHORS = {
   ISHISOMO_RES_STATION_ID: 60004318,
   ISHISOMO_RES_STATION_NAME: 'Ishisomo VII - Moon 14 - Propel Dynamics Factory',
 } as const;
+
+export const EMPIRE_HUBS: EmpireHubDef[] = [
+  {
+    id: 'jita',
+    shortName: 'Jita',
+    shortLabel: 'Jita',
+    systemId: EVE_ANCHORS.JITA_SYSTEM_ID,
+    systemName: 'Jita',
+    stationId: EVE_ANCHORS.JITA_STATION_ID,
+    stationName: EVE_ANCHORS.JITA_STATION_NAME,
+    regionId: EVE_ANCHORS.THE_FORGE_REGION_ID,
+    regionName: 'The Forge',
+    priceMultiplierFallback: 1.0,
+    volMultiplierFallback: 1.0,
+  },
+  {
+    id: 'amarr',
+    shortName: 'Amarr',
+    shortLabel: 'Amarr',
+    systemId: EVE_ANCHORS.AMARR_SYSTEM_ID,
+    systemName: 'Amarr',
+    stationId: EVE_ANCHORS.AMARR_STATION_ID,
+    stationName: EVE_ANCHORS.AMARR_STATION_NAME,
+    regionId: EVE_ANCHORS.DOMAIN_REGION_ID,
+    regionName: 'Domain',
+    priceMultiplierFallback: 1.09,
+    volMultiplierFallback: 0.34,
+  },
+  {
+    id: 'dodixie',
+    shortName: 'Dodixie',
+    shortLabel: 'Dodixie',
+    systemId: EVE_ANCHORS.DODIXIE_SYSTEM_ID,
+    systemName: 'Dodixie',
+    stationId: EVE_ANCHORS.DODIXIE_STATION_ID,
+    stationName: EVE_ANCHORS.DODIXIE_STATION_NAME,
+    regionId: EVE_ANCHORS.SINQ_LAISON_REGION_ID,
+    regionName: 'Sinq Laison',
+    priceMultiplierFallback: 1.13,
+    volMultiplierFallback: 0.22,
+  },
+  {
+    id: 'rens',
+    shortName: 'Rens',
+    shortLabel: 'Rens',
+    systemId: EVE_ANCHORS.RENS_SYSTEM_ID,
+    systemName: 'Rens',
+    stationId: EVE_ANCHORS.RENS_STATION_ID,
+    stationName: EVE_ANCHORS.RENS_STATION_NAME,
+    regionId: EVE_ANCHORS.HEIMATAR_REGION_ID,
+    regionName: 'Heimatar',
+    priceMultiplierFallback: 1.16,
+    volMultiplierFallback: 0.14,
+  },
+  {
+    id: 'hek',
+    shortName: 'Hek',
+    shortLabel: 'Hek',
+    systemId: EVE_ANCHORS.HEK_SYSTEM_ID,
+    systemName: 'Hek',
+    stationId: EVE_ANCHORS.HEK_STATION_ID,
+    stationName: EVE_ANCHORS.HEK_STATION_NAME,
+    regionId: EVE_ANCHORS.METROPOLIS_REGION_ID,
+    regionName: 'Metropolis',
+    priceMultiplierFallback: 1.19,
+    volMultiplierFallback: 0.11,
+  },
+];
+
+export const EMPIRE_HUB_MAP: Record<TradeHubId, EmpireHubDef> = Object.fromEntries(
+  EMPIRE_HUBS.map((h) => [h.id, h])
+) as Record<TradeHubId, EmpireHubDef>;
+
+export const DEFAULT_INDUSTRY_STRUCTURE_CONFIG: IndustryStructureConfig = {
+  systemId: EVE_ANCHORS.ISHISOMO_SYSTEM_ID,
+  systemName: EVE_ANCHORS.ISHISOMO_SYSTEM_NAME,
+  structureType: 'npc_station',
+  meRig: 'none',
+  teRig: 'none',
+  costRig: 'none',
+  facilityTaxPct: 0.25,
+};
+
+export const INDUSTRY_PRESET_SYSTEMS: { systemId: number; systemName: string; note: string }[] = [
+  { systemId: EVE_ANCHORS.ISHISOMO_SYSTEM_ID, systemName: 'Ishisomo', note: 'Home Indy Hub (3j Jita)' },
+  { systemId: EVE_ANCHORS.JITA_SYSTEM_ID, systemName: 'Jita', note: 'The Forge Trade Hub' },
+  { systemId: 30000144, systemName: 'Perimeter', note: '1j Jita Engineering Hub' },
+  { systemId: 30000143, systemName: 'Ikuchi', note: '1j Jita Indy Overflow' },
+  { systemId: EVE_ANCHORS.AMARR_SYSTEM_ID, systemName: 'Amarr', note: 'Domain Trade Hub' },
+  { systemId: EVE_ANCHORS.DODIXIE_SYSTEM_ID, systemName: 'Dodixie', note: 'Sinq Laison Hub' },
+  { systemId: EVE_ANCHORS.RENS_SYSTEM_ID, systemName: 'Rens', note: 'Heimatar Hub' },
+  { systemId: EVE_ANCHORS.HEK_SYSTEM_ID, systemName: 'Hek', note: 'Metropolis Hub' },
+];
 
 export interface CorridorSystem {
   systemId: number;
@@ -1097,5 +1208,70 @@ export const DEFAULT_SIMULATION_PROFILE: PilotProfile = {
     { itemId: 1011, typeId: 672, productTypeId: 672, productName: 'Caldari Shuttle', isBpo: true, me: 10, te: 20, runs: -1, locationName: 'State War Academy' },
     { itemId: 1012, typeId: 30013, productTypeId: 30013, productName: 'Core Scanner Probe I', isBpo: true, me: 10, te: 20, runs: -1, locationName: 'State War Academy' },
     { itemId: 1013, typeId: 29001, productTypeId: 29001, productName: 'Tracking Speed Script', isBpo: true, me: 10, te: 20, runs: -1, locationName: 'State War Academy' },
+  ],
+  hangarStock: {
+    34: { typeId: 34, jita: 1850000, ishisomo: 940000, total: 2790000 }, // Tritanium
+    35: { typeId: 35, jita: 420000, ishisomo: 260000, total: 680000 }, // Pyerite
+    36: { typeId: 36, jita: 95000, ishisomo: 48000, total: 143000 }, // Mexallon
+    37: { typeId: 37, jita: 22000, ishisomo: 14500, total: 36500 }, // Isogen
+    38: { typeId: 38, jita: 8500, ishisomo: 4200, total: 12700 }, // Nocxium
+    39: { typeId: 39, jita: 2400, ishisomo: 1100, total: 3500 }, // Zydrine
+    40: { typeId: 40, jita: 1100, ishisomo: 650, total: 1750 }, // Megacyte
+    11399: { typeId: 11399, jita: 620, ishisomo: 380, total: 1000 }, // Morphite
+    20410: { typeId: 20410, jita: 45, ishisomo: 30, total: 75 }, // Datacore - Rocket Science
+    20411: { typeId: 20411, jita: 40, ishisomo: 25, total: 65 }, // Datacore - High Energy Physics
+  },
+  industryJobs: [
+    {
+      jobId: 900101,
+      activityId: 1,
+      activityLabel: 'Manufacturing',
+      blueprintId: 1002,
+      blueprintTypeId: 2629,
+      blueprintName: 'Scourge Fury Heavy Missile Blueprint',
+      productTypeId: 2629,
+      productName: 'Scourge Fury Heavy Missile',
+      runs: 40,
+      cost: 2_840_000,
+      facilityId: EVE_ANCHORS.ISHISOMO_MFG_STATION_ID,
+      facilityName: EVE_ANCHORS.ISHISOMO_MFG_STATION_NAME,
+      status: 'active',
+      startDate: new Date(Date.now() - 2 * 3600_000).toISOString(),
+      endDate: new Date(Date.now() + 3.4 * 3600_000).toISOString(),
+    },
+    {
+      jobId: 900102,
+      activityId: 1,
+      activityLabel: 'Manufacturing',
+      blueprintId: 1006,
+      blueprintTypeId: 2185,
+      blueprintName: 'Hammerhead II Blueprint',
+      productTypeId: 2185,
+      productName: 'Hammerhead II',
+      runs: 20,
+      cost: 1_920_000,
+      facilityId: EVE_ANCHORS.ISHISOMO_MFG_STATION_ID,
+      facilityName: EVE_ANCHORS.ISHISOMO_MFG_STATION_NAME,
+      status: 'active',
+      startDate: new Date(Date.now() - 4 * 3600_000).toISOString(),
+      endDate: new Date(Date.now() + 1.25 * 3600_000).toISOString(),
+    },
+    {
+      jobId: 900103,
+      activityId: 8,
+      activityLabel: 'Invention',
+      blueprintId: 1003,
+      blueprintTypeId: 230,
+      blueprintName: 'Antimatter Charge M Blueprint',
+      productTypeId: 12785,
+      productName: 'Void M',
+      runs: 10,
+      cost: 410_000,
+      facilityId: EVE_ANCHORS.ISHISOMO_RES_STATION_ID,
+      facilityName: EVE_ANCHORS.ISHISOMO_RES_STATION_NAME,
+      status: 'active',
+      startDate: new Date(Date.now() - 1.5 * 3600_000).toISOString(),
+      endDate: new Date(Date.now() + 0.45 * 3600_000).toISOString(),
+    },
   ],
 };

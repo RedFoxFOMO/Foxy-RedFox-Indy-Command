@@ -2,7 +2,10 @@ import { useMemo, useState } from 'react';
 import {
   AlertTriangle,
   Building2,
+  ChevronDown,
+  ChevronUp,
   LineChart,
+  Pin,
   RefreshCw,
   ScrollText,
   Search,
@@ -10,6 +13,7 @@ import {
 } from 'lucide-react';
 import { formatIsk, formatPct } from '../engines/decisionEngines.ts';
 import type { ActionCardData, BlueprintEntry, BlueprintSyncMeta } from '../types/eve.ts';
+import { useCollapsibleCard } from '../utils/collapseStore.ts';
 
 type BlueprintFilterMode = 'all' | 'bpo' | 'bpc' | 'profitable';
 
@@ -21,6 +25,8 @@ interface BlueprintLibraryPanelProps {
   includeCorpBlueprints: boolean;
   isScanning: boolean;
   scanError: string | null;
+  pinnedTypeIds?: Set<number>;
+  onTogglePinWatchlist?: (typeId: number, name: string, kind: 'sku' | 'blueprint') => void;
   onToggleCorpBlueprints: (next: boolean) => void;
   onRescanBlueprints: () => void;
   onOpenHistory?: (typeId: number, name: string) => void;
@@ -45,11 +51,14 @@ export function BlueprintLibraryPanel({
   includeCorpBlueprints,
   isScanning,
   scanError,
+  pinnedTypeIds,
+  onTogglePinWatchlist,
   onToggleCorpBlueprints,
   onRescanBlueprints,
   onOpenHistory,
   compact = false,
 }: BlueprintLibraryPanelProps) {
+  const [collapsed, toggleCollapsed] = useCollapsibleCard('panel-blueprint-library', false);
   const [searchQuery, setSearchQuery] = useState('');
   const [filterMode, setFilterMode] = useState<BlueprintFilterMode>('all');
   const [showAllRows, setShowAllRows] = useState(false);
@@ -248,8 +257,25 @@ export function BlueprintLibraryPanel({
             />
             <span>{isScanning ? 'Scanning X-Pages...' : 'Rescan All (X-Pages)'}</span>
           </button>
+
+          <button
+            type="button"
+            onClick={toggleCollapsed}
+            aria-expanded={!collapsed}
+            aria-label={collapsed ? 'Expand Tracked Blueprint Library' : 'Collapse Tracked Blueprint Library'}
+            className="p-1.5 rounded border border-slate-700/80 bg-[#0b0e14] text-slate-400 hover:text-slate-100 hover:border-slate-600 transition-colors cursor-pointer"
+          >
+            {collapsed ? (
+              <ChevronDown className="w-3.5 h-3.5" aria-hidden="true" />
+            ) : (
+              <ChevronUp className="w-3.5 h-3.5" aria-hidden="true" />
+            )}
+          </button>
         </div>
       </div>
+
+      {!collapsed && (
+        <>
 
       {/* Inline Warnings / Corp Status */}
       {(scanError ||
@@ -449,20 +475,40 @@ export function BlueprintLibraryPanel({
                       )}
                     </td>
 
-                    {onOpenHistory && (
-                      <td className="py-2 px-2 text-center">
-                        {historyTypeId ? (
-                          <button
-                            type="button"
-                            onClick={() => onOpenHistory(historyTypeId, historyName)}
-                            title={`Open 30d market history for ${historyName}`}
-                            className="p-1 rounded text-slate-400 hover:text-cyan-300 hover:bg-slate-800 transition-colors cursor-pointer"
-                          >
-                            <LineChart className="w-3.5 h-3.5" />
-                          </button>
-                        ) : (
-                          <span className="text-slate-700">·</span>
-                        )}
+                    {(onOpenHistory || onTogglePinWatchlist) && (
+                      <td className="py-2 px-2 text-center whitespace-nowrap">
+                        <div className="inline-flex items-center gap-1">
+                          {onTogglePinWatchlist && historyTypeId && (
+                            <button
+                              type="button"
+                              onClick={() =>
+                                onTogglePinWatchlist(historyTypeId, historyName, 'blueprint')
+                              }
+                              title={
+                                pinnedTypeIds?.has(historyTypeId)
+                                  ? `Unpin ${historyName} from Watchlist`
+                                  : `Pin ${historyName} to Watchlist`
+                              }
+                              className={`p-1 rounded transition-colors cursor-pointer ${
+                                pinnedTypeIds?.has(historyTypeId)
+                                  ? 'text-cyan-300 bg-cyan-500/15'
+                                  : 'text-slate-400 hover:text-cyan-300 hover:bg-slate-800'
+                              }`}
+                            >
+                              <Pin className="w-3.5 h-3.5" />
+                            </button>
+                          )}
+                          {onOpenHistory && historyTypeId ? (
+                            <button
+                              type="button"
+                              onClick={() => onOpenHistory(historyTypeId, historyName)}
+                              title={`Open 30d market history for ${historyName}`}
+                              className="p-1 rounded text-slate-400 hover:text-cyan-300 hover:bg-slate-800 transition-colors cursor-pointer"
+                            >
+                              <LineChart className="w-3.5 h-3.5" />
+                            </button>
+                          ) : null}
+                        </div>
                       </td>
                     )}
                   </tr>
@@ -487,6 +533,8 @@ export function BlueprintLibraryPanel({
             Show All {filteredRows.length.toLocaleString()} Matching
           </button>
         </div>
+      )}
+        </>
       )}
     </div>
   );

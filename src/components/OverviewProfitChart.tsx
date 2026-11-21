@@ -8,9 +8,10 @@ import {
   XAxis,
   YAxis,
 } from 'recharts';
-import { ChevronDown, ChevronRight, LineChart } from 'lucide-react';
+import { ChevronDown, ChevronRight, ChevronUp, LineChart } from 'lucide-react';
 import { formatIsk, formatM3, formatPct } from '../engines/decisionEngines.ts';
 import type { ActionCardData } from '../types/eve.ts';
+import { useCollapsibleCard } from '../utils/collapseStore.ts';
 
 interface OverviewProfitChartProps {
   cards: ActionCardData[];
@@ -117,6 +118,7 @@ export function OverviewProfitChart({
   onOpenHistory,
   onInspectCard,
 }: OverviewProfitChartProps) {
+  const [collapsed, toggleCollapsed] = useCollapsibleCard('panel-overview-chart', false);
   const [tableOpen, setTableOpen] = useState(true);
 
   const topTen = useMemo<ChartDatum[]>(() => {
@@ -162,19 +164,38 @@ export function OverviewProfitChart({
           </p>
         </div>
 
-        {/* Inline Legend */}
-        <div className="flex items-center gap-4 text-xs text-slate-300 shrink-0">
-          <span className="inline-flex items-center gap-1.5 whitespace-nowrap">
-            <span className="w-2.5 h-2.5 rounded-xs bg-cyan-400 inline-block" aria-hidden="true" />
-            <span>Full-Batch ISK</span>
-          </span>
-          <span className="inline-flex items-center gap-1.5 whitespace-nowrap">
-            <span className="w-2.5 h-2.5 rounded-xs bg-amber-400 inline-block" aria-hidden="true" />
-            <span>Per-Unit ISK</span>
-          </span>
+        {/* Inline Legend + Collapse Toggle */}
+        <div className="flex items-center gap-3 text-xs text-slate-300 shrink-0">
+          {!collapsed && (
+            <>
+              <span className="inline-flex items-center gap-1.5 whitespace-nowrap">
+                <span className="w-2.5 h-2.5 rounded-xs bg-cyan-400 inline-block" aria-hidden="true" />
+                <span>Full-Batch ISK</span>
+              </span>
+              <span className="inline-flex items-center gap-1.5 whitespace-nowrap">
+                <span className="w-2.5 h-2.5 rounded-xs bg-amber-400 inline-block" aria-hidden="true" />
+                <span>Per-Unit ISK</span>
+              </span>
+            </>
+          )}
+          <button
+            type="button"
+            onClick={toggleCollapsed}
+            aria-expanded={!collapsed}
+            aria-label={collapsed ? 'Expand Overview Profit Chart' : 'Collapse Overview Profit Chart'}
+            className="p-1.5 rounded border border-slate-700/80 bg-[#0b0e14] text-slate-400 hover:text-slate-100 hover:border-slate-600 transition-colors cursor-pointer"
+          >
+            {collapsed ? (
+              <ChevronDown className="w-3.5 h-3.5" aria-hidden="true" />
+            ) : (
+              <ChevronUp className="w-3.5 h-3.5" aria-hidden="true" />
+            )}
+          </button>
         </div>
       </div>
 
+      {!collapsed && (
+        <>
       {/* Recharts Dual-Axis Horizontal Bar Chart */}
       <div className="px-4 py-4">
         <div style={{ width: '100%', height: chartHeight }}>
@@ -339,6 +360,8 @@ export function OverviewProfitChart({
           </div>
         )}
       </div>
+        </>
+      )}
     </section>
   );
 }

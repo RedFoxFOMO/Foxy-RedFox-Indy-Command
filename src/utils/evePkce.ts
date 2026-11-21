@@ -3,6 +3,7 @@
 export const EVE_SSO_SCOPES = [
   'esi-characters.read_blueprints.v1',
   'esi-corporations.read_blueprints.v1',
+  'esi-industry.read_character_jobs.v1',
   'esi-skills.read_skills.v1',
   'esi-location.read_location.v1',
   'esi-location.read_ship_type.v1',

@@ -6,6 +6,7 @@ import { GoogleGenAI, ThinkingLevel, Type } from '@google/genai';
 import type { Content, FunctionDeclaration, Part } from '@google/genai';
 import {
   CORRIDOR_SYSTEM_MAP,
+  EMPIRE_HUB_MAP,
   EVE_ANCHORS,
   EVE_ITEMS,
   ITEM_BY_ID,
@@ -35,15 +36,24 @@ import type {
   AppStateSummary,
   BlueprintEntry,
   BlueprintSyncMeta,
+  CharacterIndustryJob,
   CorridorOrder,
   HangarHull,
+  HangarStockEntry,
   HotSystemIntel,
+  HubQuote,
+  IndustryCostSnapshot,
   MarketCategoryId,
   MarketHistoryDay,
   MarketHistoryResponse,
   MarketQuote,
   MarketSnapshot,
+  OrderMonitorEntry,
+  OrderMonitorSnapshot,
   PilotProfile,
+  SystemCostIndices,
+  TradeHubId,
+  WalletTransactionEntry,
 } from './src/types/eve.ts';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -219,12 +229,25 @@ async function fetchEsiCorridorOrdersForTypes(
 app.get('/api/market/sync', async (req, res) => {
   try {
     const rawCats = String(req.query.categories || '');
+    const rawHubs = String(req.query.hubs || 'jita,dodixie');
     const force = req.query.force === 'true';
     const validCatSet = new Set(MARKET_CATEGORIES.map((c) => c.id));
     const categories = rawCats
       .split(',')
       .map((s) => s.trim())
       .filter((s): s is MarketCategoryId => validCatSet.has(s as MarketCategoryId));
+
+    const validHubIds: TradeHubId[] = ['jita', 'amarr', 'dodixie', 'rens', 'hek'];
+    const requestedHubs = Array.from(
+      new Set<TradeHubId>([
+        'jita',
+        'dodixie',
+        ...rawHubs
+          .split(',')
+          .map((h) => h.trim().toLowerCase())
+          .filter((h): h is TradeHubId => validHubIds.includes(h as TradeHubId)),
+      ])
+    );
 
     if (categories.length === 0) {
       const emptySnapshot: MarketSnapshot = {
@@ -244,17 +267,24 @@ app.get('/api/market/sync', async (req, res) => {
       ? typeIds
       : typeIds.filter((id) => {
           const entry = quoteCache.get(id);
-          return !entry || now - entry.fetchedAt > CACHE_TTL_MS;
+          if (!entry || now - entry.fetchedAt > CACHE_TTL_MS) return true;
+          // Re-fetch if any requested non-core hub isn't cached yet on this quote
+          return requestedHubs.some((h) => h !== 'jita' && h !== 'dodixie' && !entry.quote.hubs?.[h]);
         });
 
-    let jitaData: Record<number, FuzzworkItemAgg> = {};
-    let dodixieData: Record<number, FuzzworkItemAgg> = {};
+    const hubDataMap: Partial<Record<TradeHubId, Record<number, FuzzworkItemAgg>>> = {};
 
     if (uncachedIds.length > 0) {
-      [jitaData, dodixieData] = await Promise.all([
-        fetchFuzzworkStation(EVE_ANCHORS.JITA_STATION_ID, uncachedIds),
-        fetchFuzzworkStation(EVE_ANCHORS.DODIXIE_STATION_ID, uncachedIds),
-      ]);
+      const hubResults = await Promise.all(
+        requestedHubs.map(async (hubId) => {
+          const stationId = EMPIRE_HUB_MAP[hubId].stationId;
+          const data = await fetchFuzzworkStation(stationId, uncachedIds);
+          return [hubId, data] as const;
+        })
+      );
+      for (const [hubId, data] of hubResults) {
+        hubDataMap[hubId] = data;
+      }
     }
 
     // Scan ESI regional orders for 2-jump corridor & 1-jump Jita discounts
@@ -267,45 +297,79 @@ app.get('/api/market/sync', async (req, res) => {
       corridorByType.set(o.typeId, arr);
     }
 
+    const buildHubQuote = (
+      agg: FuzzworkItemAgg | undefined,
+      fallbackSell: number,
+      fallbackBuy: number,
+      fallbackVol: number
+    ): HubQuote => {
+      const sellMin = Number(agg?.sell?.min || 0);
+      const buyMax = Number(agg?.buy?.max || 0);
+      return {
+        sellMin: sellMin > 0 ? sellMin : fallbackSell,
+        sellVolume: Number(agg?.sell?.volume || fallbackVol || 0),
+        buyMax: buyMax > 0 ? buyMax : fallbackBuy,
+        buyVolume: Number(agg?.buy?.volume || fallbackVol || 0),
+        sellPercentile: Number(agg?.sell?.percentile || sellMin || fallbackSell),
+        buyPercentile: Number(agg?.buy?.percentile || buyMax || fallbackBuy),
+      };
+    };
+
     const quotes: Record<number, MarketQuote> = {};
     let liveCount = 0;
 
     for (const id of typeIds) {
       const item = ITEM_BY_ID[id];
       const cached = !force ? quoteCache.get(id) : undefined;
+      const missingExtraHub =
+        cached && requestedHubs.some((h) => h !== 'jita' && h !== 'dodixie' && !cached.quote.hubs?.[h]);
       let quote: MarketQuote;
 
-      if (cached && now - cached.fetchedAt <= CACHE_TTL_MS) {
-        quote = { ...cached.quote };
+      if (cached && !missingExtraHub && now - cached.fetchedAt <= CACHE_TTL_MS) {
+        quote = { ...cached.quote, hubs: { ...(cached.quote.hubs || {}) } };
       } else {
-        const jAgg = jitaData[id];
-        const dAgg = dodixieData[id];
+        const jAgg = hubDataMap.jita?.[id];
+        const dAgg = hubDataMap.dodixie?.[id];
 
         const jSellMin = Number(jAgg?.sell?.min || 0);
         const jBuyMax = Number(jAgg?.buy?.max || 0);
-        const dSellMin = Number(dAgg?.sell?.min || 0);
-        const dBuyMax = Number(dAgg?.buy?.max || 0);
+        const baseJitaSell = jSellMin > 0 ? jSellMin : item?.baseJitaSell ?? 1000;
+        const baseJitaBuy = jBuyMax > 0 ? jBuyMax : item?.baseJitaBuy ?? baseJitaSell * 0.9;
 
         const hasLiveJita = jSellMin > 0 || jBuyMax > 0;
 
+        const jitaQuote = buildHubQuote(jAgg, baseJitaSell, baseJitaBuy, item?.estDailyJitaVol ?? 0);
+        const dodixieQuote = buildHubQuote(
+          dAgg,
+          item?.baseDodixieSell ?? baseJitaSell * 1.12,
+          item?.baseDodixieBuy ?? baseJitaBuy * 1.02,
+          item?.estDailyDodixieVol ?? 0
+        );
+
+        const hubs: Partial<Record<TradeHubId, HubQuote>> = {
+          ...(cached?.quote.hubs || {}),
+          jita: jitaQuote,
+          dodixie: dodixieQuote,
+        };
+
+        for (const hubId of requestedHubs) {
+          if (hubId === 'jita' || hubId === 'dodixie') continue;
+          const agg = hubDataMap[hubId]?.[id];
+          const hubMult =
+            hubId === 'amarr' ? 1.07 : hubId === 'rens' ? 1.15 : hubId === 'hek' ? 1.17 : 1.12;
+          hubs[hubId] = buildHubQuote(
+            agg,
+            baseJitaSell * hubMult,
+            baseJitaBuy * (hubMult - 0.08),
+            Math.max(1, Math.round((item?.estDailyDodixieVol ?? 10) * 0.7))
+          );
+        }
+
         quote = {
           typeId: id,
-          jita: {
-            sellMin: jSellMin > 0 ? jSellMin : item?.baseJitaSell ?? 1000,
-            sellVolume: Number(jAgg?.sell?.volume || item?.estDailyJitaVol || 0),
-            buyMax: jBuyMax > 0 ? jBuyMax : item?.baseJitaBuy ?? (item?.baseJitaSell ?? 1000) * 0.9,
-            buyVolume: Number(jAgg?.buy?.volume || item?.estDailyJitaVol || 0),
-            sellPercentile: Number(jAgg?.sell?.percentile || jSellMin || item?.baseJitaSell || 1000),
-            buyPercentile: Number(jAgg?.buy?.percentile || jBuyMax || item?.baseJitaBuy || 900),
-          },
-          dodixie: {
-            sellMin: dSellMin > 0 ? dSellMin : item?.baseDodixieSell ?? (jSellMin || item?.baseJitaSell || 1000) * 1.12,
-            sellVolume: Number(dAgg?.sell?.volume || item?.estDailyDodixieVol || 0),
-            buyMax: dBuyMax > 0 ? dBuyMax : item?.baseDodixieBuy ?? (jBuyMax || item?.baseJitaBuy || 900) * 1.02,
-            buyVolume: Number(dAgg?.buy?.volume || item?.estDailyDodixieVol || 0),
-            sellPercentile: Number(dAgg?.sell?.percentile || dSellMin || item?.baseDodixieSell || 1100),
-            buyPercentile: Number(dAgg?.buy?.percentile || dBuyMax || item?.baseDodixieBuy || 950),
-          },
+          jita: jitaQuote,
+          dodixie: dodixieQuote,
+          hubs,
           source: hasLiveJita ? 'live' : 'baseline',
         };
 
@@ -350,6 +414,107 @@ app.get('/api/market/sync', async (req, res) => {
   } catch (err) {
     console.error('Market sync error:', err);
     res.status(500).json({ error: 'Failed to synchronize EVE market endpoints.' });
+  }
+});
+
+// --- Route 1a-0: Live CCP System Cost Indices (/industry/systems/) & Adjusted Base Prices (/markets/prices/) ---
+
+let industryCostsCache: { payload: IndustryCostSnapshot; fetchedAt: number } | null = null;
+const INDUSTRY_COSTS_TTL_MS = 60 * 60 * 1000;
+
+app.get('/api/industry/cost-indices', async (req, res) => {
+  try {
+    const force = req.query.force === 'true';
+    if (!force && industryCostsCache && Date.now() - industryCostsCache.fetchedAt < INDUSTRY_COSTS_TTL_MS) {
+      res.json(industryCostsCache.payload);
+      return;
+    }
+
+    const [sysRes, pricesRes] = await Promise.all([
+      fetchWithTimeout('https://esi.evetech.net/latest/industry/systems/?datasource=tranquility', {}, 12000),
+      fetchWithTimeout('https://esi.evetech.net/latest/markets/prices/?datasource=tranquility', {}, 12000),
+    ]);
+
+    const costIndicesBySystem: Record<number, SystemCostIndices> = {};
+    const trackedSystemIds = new Set<number>([
+      30000137, // Ishisomo
+      30000142, // Jita
+      30000144, // Perimeter
+      30002187, // Amarr
+      30002659, // Dodixie
+      30002510, // Rens
+      30002053, // Hek
+      ...Object.keys(CORRIDOR_SYSTEM_MAP).map(Number),
+    ]);
+    const reqSystemsRaw = String(req.query.systemIds || '');
+    for (const s of reqSystemsRaw.split(',')) {
+      const id = Number(s.trim());
+      if (Number.isInteger(id) && id > 0) trackedSystemIds.add(id);
+    }
+
+    if (sysRes.ok) {
+      const rawSystems = (await sysRes.json()) as {
+        solar_system_id: number;
+        cost_indices: { activity: string; cost_index: number }[];
+      }[];
+      if (Array.isArray(rawSystems)) {
+        for (const entry of rawSystems) {
+          if (!trackedSystemIds.has(entry.solar_system_id)) continue;
+          const idx: SystemCostIndices = {
+            systemId: entry.solar_system_id,
+            manufacturing: 0.04,
+            copying: 0.015,
+            invention: 0.02,
+            researching_material_efficiency: 0.015,
+            researching_time_efficiency: 0.015,
+            reaction: 0.03,
+          };
+          for (const ci of entry.cost_indices || []) {
+            if (ci.activity === 'manufacturing') idx.manufacturing = ci.cost_index;
+            else if (ci.activity === 'copying') idx.copying = ci.cost_index;
+            else if (ci.activity === 'invention') idx.invention = ci.cost_index;
+            else if (ci.activity === 'researching_material_efficiency')
+              idx.researching_material_efficiency = ci.cost_index;
+            else if (ci.activity === 'researching_time_efficiency')
+              idx.researching_time_efficiency = ci.cost_index;
+            else if (ci.activity === 'reaction') idx.reaction = ci.cost_index;
+          }
+          costIndicesBySystem[entry.solar_system_id] = idx;
+        }
+      }
+    }
+
+    const adjustedPricesByType: Record<number, number> = {};
+    if (pricesRes.ok) {
+      const rawPrices = (await pricesRes.json()) as {
+        type_id: number;
+        adjusted_price?: number;
+        average_price?: number;
+      }[];
+      if (Array.isArray(rawPrices)) {
+        const knownItemIds = new Set(EVE_ITEMS.map((i) => i.typeId));
+        for (const p of rawPrices) {
+          if (!knownItemIds.has(p.type_id)) continue;
+          const val = p.adjusted_price ?? p.average_price ?? 0;
+          if (val > 0) adjustedPricesByType[p.type_id] = val;
+        }
+      }
+    }
+
+    const payload: IndustryCostSnapshot = {
+      costIndicesBySystem,
+      adjustedPricesByType,
+      fetchedAt: new Date().toISOString(),
+      source: Object.keys(costIndicesBySystem).length > 0 ? 'esi_live' : 'baseline',
+    };
+
+    if (payload.source === 'esi_live') {
+      industryCostsCache = { payload, fetchedAt: Date.now() };
+    }
+    res.json(payload);
+  } catch (err) {
+    console.error('ESI industry cost indices error:', err);
+    res.status(500).json({ error: 'Unable to fetch live CCP system cost indices.' });
   }
 });
 
@@ -436,10 +601,16 @@ app.get('/api/market/history', async (req, res) => {
       return;
     }
 
-    const allowedRegion =
-      regionId === EVE_ANCHORS.SINQ_LAISON_REGION_ID
-        ? EVE_ANCHORS.SINQ_LAISON_REGION_ID
-        : EVE_ANCHORS.THE_FORGE_REGION_ID;
+    const allowedRegions = new Set<number>([
+      EVE_ANCHORS.THE_FORGE_REGION_ID,
+      EVE_ANCHORS.SINQ_LAISON_REGION_ID,
+      EVE_ANCHORS.DOMAIN_REGION_ID,
+      EVE_ANCHORS.HEIMATAR_REGION_ID,
+      EVE_ANCHORS.METROPOLIS_REGION_ID,
+    ]);
+    const allowedRegion = allowedRegions.has(regionId)
+      ? regionId
+      : EVE_ANCHORS.THE_FORGE_REGION_ID;
 
     const cacheKey = `${allowedRegion}:${typeId}`;
     const cached = historyCache.get(cacheKey);
@@ -1278,9 +1449,14 @@ app.get('/api/route/resolve-system', async (req, res) => {
 
 app.get('/api/eve/sso-config', (_req, res) => {
   const baseUrl = (process.env.APP_URL || '').replace(/\/+$/, '');
+  const envEveClientId = (process.env.EVE_CLIENT_ID || '').trim();
+  const envGeminiKey = (process.env.GEMINI_API_KEY || '').trim();
+  const hasEnvGeminiKey = Boolean(envGeminiKey && envGeminiKey !== 'MY_GEMINI_API_KEY');
   res.json({
-    callbackUrl: baseUrl ? `${baseUrl}/auth/callback` : '/auth/callback',
-    serverClientId: process.env.EVE_CLIENT_ID || '',
+    callbackUrl: baseUrl ? `${baseUrl}/` : '/',
+    serverClientId: envEveClientId,
+    hasEnvEveClientId: Boolean(envEveClientId),
+    hasEnvGeminiKey,
   });
 });
 
@@ -1294,7 +1470,7 @@ const handleOAuthCallback: express.RequestHandler = (req, res) => {
     code,
     state,
     error,
-  });
+  }).replace(/</g, '\\u003c');
 
   res.setHeader('Content-Type', 'text/html; charset=utf-8');
   res.send(`<!doctype html>
@@ -1315,7 +1491,7 @@ const handleOAuthCallback: express.RequestHandler = (req, res) => {
       (function() {
         var data = ${payload};
         if (window.opener) {
-          window.opener.postMessage(data, '*');
+          window.opener.postMessage(data, window.location.origin);
           setTimeout(function() { window.close(); }, 350);
         }
       })();
@@ -1346,7 +1522,9 @@ app.post('/api/eve/token', async (req, res) => {
       clientId?: string;
     };
 
-    const resolvedClientId = clientId || process.env.EVE_CLIENT_ID;
+    const envClientId = (process.env.EVE_CLIENT_ID || '').trim();
+    const customClientId = typeof clientId === 'string' ? clientId.trim() : '';
+    const resolvedClientId = envClientId || customClientId;
     if (!code || !codeVerifier || !resolvedClientId) {
       res.status(400).json({ error: 'Missing authorization code, PKCE verifier, or EVE Client ID.' });
       return;
@@ -1673,6 +1851,7 @@ app.post('/api/eve/sync-character', async (req, res) => {
       skillsRes,
       personalBpResult,
       assetsPage1Res,
+      industryJobsRes,
     ] = await Promise.all([
       fetchWithTimeout(`${base}/?datasource=tranquility`),
       fetchWithTimeout(`${base}/wallet/?datasource=tranquility`, { headers: esiHeaders }),
@@ -1682,6 +1861,9 @@ app.post('/api/eve/sync-character', async (req, res) => {
       fetchWithTimeout(`${base}/skills/?datasource=tranquility`, { headers: esiHeaders }),
       fetchAllPaginatedBlueprints(`${base}/blueprints/`, esiHeaders),
       fetchWithTimeout(`${base}/assets/?datasource=tranquility&page=1`, { headers: esiHeaders }),
+      fetchWithTimeout(`${base}/industry/jobs/?datasource=tranquility&include_completed=false`, {
+        headers: esiHeaders,
+      }),
     ]);
 
     let corporationId: number | undefined;
@@ -1798,6 +1980,10 @@ app.post('/api/eve/sync-character', async (req, res) => {
       scrapmetalProcessing: 5,
       industry: 5,
       scienceEncryption: 5,
+      massProduction: 5,
+      advancedMassProduction: 4,
+      laboratoryOperation: 5,
+      advancedLaboratoryOperation: 4,
     };
     const haulingSkills: Record<number, number> = {};
 
@@ -1820,6 +2006,10 @@ app.post('/api/eve/sync-character', async (req, res) => {
       if (skillMap.has(12196)) skills.scrapmetalProcessing = skillMap.get(12196)!;
       if (skillMap.has(3380)) skills.industry = skillMap.get(3380)!;
       if (skillMap.has(3402)) skills.scienceEncryption = skillMap.get(3402)!;
+      skills.massProduction = skillMap.get(3387) ?? 0;
+      skills.advancedMassProduction = skillMap.get(24625) ?? 0;
+      skills.laboratoryOperation = skillMap.get(3406) ?? 0;
+      skills.advancedLaboratoryOperation = skillMap.get(24624) ?? 0;
 
       for (const hSkillId of ALL_HAULING_SKILL_ID_LIST) {
         haulingSkills[hSkillId] = skillMap.get(hSkillId) ?? 0;
@@ -2021,6 +2211,119 @@ app.post('/api/eve/sync-character', async (req, res) => {
       return b.capacityM3 - a.capacityM3;
     });
 
+    // Aggregate Jita & Ishisomo hangar item stock from allAssets for Multibuy Hangar Stock Deductor
+    const hangarStock: Record<number, HangarStockEntry> = {};
+    const jitaStations = new Set<number>([EVE_ANCHORS.JITA_STATION_ID, EVE_ANCHORS.JITA_SYSTEM_ID]);
+    const ishisomoStations = new Set<number>([
+      EVE_ANCHORS.ISHISOMO_MFG_STATION_ID,
+      EVE_ANCHORS.ISHISOMO_RES_STATION_ID,
+      EVE_ANCHORS.ISHISOMO_SYSTEM_ID,
+    ]);
+    for (const a of allAssets) {
+      const flag = a.location_flag || '';
+      if (/^(LoSlot|MedSlot|HiSlot|RigSlot|SubSystemSlot)\d*$/i.test(flag)) continue;
+      if (HAULER_HULL_CATALOG[a.type_id]) continue;
+      const qty = typeof a.quantity === 'number' && a.quantity > 0 ? a.quantity : 1;
+      const rootLocId = resolveRootLocationId(a);
+      const isJita = jitaStations.has(rootLocId);
+      const isIshisomo = ishisomoStations.has(rootLocId);
+      if (!isJita && !isIshisomo) continue;
+      const entry = hangarStock[a.type_id] ?? {
+        typeId: a.type_id,
+        jita: 0,
+        ishisomo: 0,
+        total: 0,
+      };
+      if (isJita) entry.jita += qty;
+      if (isIshisomo) entry.ishisomo += qty;
+      entry.total = entry.jita + entry.ishisomo;
+      hangarStock[a.type_id] = entry;
+    }
+
+    // Hydrate Active Character Industry Jobs (/characters/{id}/industry/jobs/)
+    const activityLabels: Record<number, CharacterIndustryJob['activityLabel']> = {
+      1: 'Manufacturing',
+      3: 'TE Research',
+      4: 'ME Research',
+      5: 'Copying',
+      8: 'Invention',
+      9: 'Reaction',
+    };
+    let industryJobs: CharacterIndustryJob[] = [];
+    if (industryJobsRes.ok) {
+      try {
+        const rawJobs = (await industryJobsRes.json()) as {
+          job_id: number;
+          activity_id: number;
+          blueprint_type_id: number;
+          product_type_id?: number;
+          runs: number;
+          status: string;
+          start_date: string;
+          end_date: string;
+          duration: number;
+          cost?: number;
+          facility_id: number;
+          station_id: number;
+        }[];
+        if (Array.isArray(rawJobs) && rawJobs.length > 0) {
+          const jobTypeIds = new Set<number>();
+          for (const j of rawJobs) {
+            if (j.blueprint_type_id > 0) jobTypeIds.add(j.blueprint_type_id);
+            if (j.product_type_id && j.product_type_id > 0) jobTypeIds.add(j.product_type_id);
+            if (j.station_id > 0 && j.station_id < 1_000_000_000) jobTypeIds.add(j.station_id);
+          }
+          const jobNames = await resolveUniverseNames(Array.from(jobTypeIds));
+          industryJobs = rawJobs
+            .map((j): CharacterIndustryJob => {
+              const bpName =
+                jobNames.get(j.blueprint_type_id) ||
+                ITEM_BY_ID[j.blueprint_type_id]?.name ||
+                `Blueprint #${j.blueprint_type_id}`;
+              const productName = j.product_type_id
+                ? jobNames.get(j.product_type_id) ||
+                  ITEM_BY_ID[j.product_type_id]?.name ||
+                  `Type #${j.product_type_id}`
+                : bpName.replace(/\s+Blueprint$/i, '');
+              const facilityName =
+                orderBookStationCache.get(j.station_id) ||
+                jobNames.get(j.station_id) ||
+                (j.facility_id >= 1_000_000_000
+                  ? `Upwell Structure #${j.facility_id}`
+                  : `Station #${j.station_id}`);
+              const statusClean: CharacterIndustryJob['status'] =
+                j.status === 'active' ||
+                j.status === 'paused' ||
+                j.status === 'ready' ||
+                j.status === 'delivered' ||
+                j.status === 'cancelled'
+                  ? j.status
+                  : 'active';
+              return {
+                jobId: j.job_id,
+                activityId: j.activity_id,
+                activityLabel: activityLabels[j.activity_id] ?? 'Other',
+                blueprintTypeId: j.blueprint_type_id,
+                blueprintName: bpName,
+                productTypeId: j.product_type_id,
+                productName,
+                runs: j.runs,
+                status: statusClean,
+                startDate: j.start_date,
+                endDate: j.end_date,
+                durationSeconds: j.duration,
+                costIsk: j.cost,
+                facilityId: j.facility_id,
+                facilityName,
+              };
+            })
+            .sort((a, b) => Date.parse(a.endDate) - Date.parse(b.endDate));
+        }
+      } catch {
+        industryJobs = [];
+      }
+    }
+
     // Hydrate 100% of personal (+ optional corp) blueprints with real EVE names via POST /universe/names/
     const blueprints = await hydrateEsiBlueprints({
       personalRaw: personalBpResult.rows,
@@ -2055,6 +2358,9 @@ app.post('/api/eve/sync-character', async (req, res) => {
       hulls: detectedHulls,
       activeOrders,
       activeOrdersSyncedAt: new Date().toISOString(),
+      industryJobs,
+      industryJobsSyncedAt: new Date().toISOString(),
+      hangarStock,
     });
   } catch (err) {
     console.error('ESI character sync error:', err);
@@ -2137,6 +2443,352 @@ app.post('/api/eve/wallet-orders', async (req, res) => {
   } catch (err) {
     console.error('ESI wallet/orders refresh error:', err);
     res.status(500).json({ error: 'Failed to refresh wallet balance and active orders from ESI.' });
+  }
+});
+
+// --- Route 2a-0b: On-Demand Active Industry Jobs Refresh (esi-industry.read_character_jobs.v1) ---
+
+app.post('/api/eve/industry-jobs', async (req, res) => {
+  try {
+    const authHeader = req.headers.authorization || '';
+    const accessToken = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : '';
+    const { characterId } = req.body as { characterId?: number };
+
+    if (!accessToken || !characterId) {
+      res.status(401).json({
+        error: 'Connect EVE SSO (with esi-industry.read_character_jobs.v1) to refresh active industry jobs.',
+      });
+      return;
+    }
+
+    const esiHeaders = { Authorization: `Bearer ${accessToken}` };
+    const jobsRes = await fetchWithTimeout(
+      `https://esi.evetech.net/latest/characters/${characterId}/industry/jobs/?datasource=tranquility&include_completed=false`,
+      { headers: esiHeaders },
+      9000
+    );
+
+    if (jobsRes.status === 401 || jobsRes.status === 403) {
+      res.status(jobsRes.status).json({
+        error: 'EVE SSO token lacks esi-industry.read_character_jobs.v1 scope. Reconnect EVE SSO to authorize.',
+      });
+      return;
+    }
+    if (!jobsRes.ok) {
+      res.status(502).json({ error: `EVE ESI industry jobs returned HTTP ${jobsRes.status}.` });
+      return;
+    }
+
+    const rawJobs = (await jobsRes.json()) as {
+      job_id: number;
+      activity_id: number;
+      blueprint_type_id: number;
+      product_type_id?: number;
+      runs: number;
+      status: string;
+      start_date: string;
+      end_date: string;
+      duration: number;
+      cost?: number;
+      facility_id: number;
+      station_id: number;
+    }[];
+
+    const activityLabels: Record<number, CharacterIndustryJob['activityLabel']> = {
+      1: 'Manufacturing',
+      3: 'TE Research',
+      4: 'ME Research',
+      5: 'Copying',
+      8: 'Invention',
+      9: 'Reaction',
+    };
+
+    const idsToResolve = new Set<number>();
+    for (const j of Array.isArray(rawJobs) ? rawJobs : []) {
+      if (j.blueprint_type_id > 0) idsToResolve.add(j.blueprint_type_id);
+      if (j.product_type_id && j.product_type_id > 0) idsToResolve.add(j.product_type_id);
+      if (j.station_id > 0 && j.station_id < 1_000_000_000) idsToResolve.add(j.station_id);
+    }
+    const resolved = await resolveUniverseNames(Array.from(idsToResolve));
+
+    const jobs: CharacterIndustryJob[] = (Array.isArray(rawJobs) ? rawJobs : [])
+      .map((j): CharacterIndustryJob => {
+        const bpName =
+          resolved.get(j.blueprint_type_id) ||
+          ITEM_BY_ID[j.blueprint_type_id]?.name ||
+          `Blueprint #${j.blueprint_type_id}`;
+        const productName = j.product_type_id
+          ? resolved.get(j.product_type_id) ||
+            ITEM_BY_ID[j.product_type_id]?.name ||
+            `Type #${j.product_type_id}`
+          : bpName.replace(/\s+Blueprint$/i, '');
+        const facilityName =
+          orderBookStationCache.get(j.station_id) ||
+          resolved.get(j.station_id) ||
+          (j.facility_id >= 1_000_000_000
+            ? `Upwell Structure #${j.facility_id}`
+            : `Station #${j.station_id}`);
+        const statusClean: CharacterIndustryJob['status'] =
+          j.status === 'active' ||
+          j.status === 'paused' ||
+          j.status === 'ready' ||
+          j.status === 'delivered' ||
+          j.status === 'cancelled'
+            ? j.status
+            : 'active';
+        return {
+          jobId: j.job_id,
+          activityId: j.activity_id,
+          activityLabel: activityLabels[j.activity_id] ?? 'Other',
+          blueprintTypeId: j.blueprint_type_id,
+          blueprintName: bpName,
+          productTypeId: j.product_type_id,
+          productName,
+          runs: j.runs,
+          status: statusClean,
+          startDate: j.start_date,
+          endDate: j.end_date,
+          durationSeconds: j.duration,
+          costIsk: j.cost,
+          facilityId: j.facility_id,
+          facilityName,
+        };
+      })
+      .sort((a, b) => Date.parse(a.endDate) - Date.parse(b.endDate));
+
+    res.json({
+      jobs,
+      syncedAt: new Date().toISOString(),
+    });
+  } catch (err) {
+    console.error('ESI industry jobs refresh error:', err);
+    res.status(500).json({ error: 'Failed to refresh active industry jobs from ESI.' });
+  }
+});
+
+// --- Route 2a-0c: Undercut & Fill Monitor (Active Orders vs Live Order Books + Wallet Transactions Profit) ---
+
+function computeServerEveTick(price: number): number {
+  if (!Number.isFinite(price) || price <= 0) return 0.01;
+  const digits = Math.floor(Math.log10(price)) + 1;
+  if (digits <= 4) return 0.01;
+  return Math.pow(10, digits - 4);
+}
+
+app.post('/api/eve/order-monitor', async (req, res) => {
+  try {
+    const authHeader = req.headers.authorization || '';
+    const accessToken = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : '';
+    const { characterId } = req.body as { characterId?: number };
+
+    if (!accessToken || !characterId) {
+      res.status(401).json({
+        error: 'Connect EVE SSO to monitor live undercut orders and realized wallet fills.',
+      });
+      return;
+    }
+
+    const esiHeaders = { Authorization: `Bearer ${accessToken}` };
+    const base = `https://esi.evetech.net/latest/characters/${characterId}`;
+
+    const [ordersRes, txRes] = await Promise.all([
+      fetchWithTimeout(`${base}/orders/?datasource=tranquility`, { headers: esiHeaders }, 9000),
+      fetchWithTimeout(`${base}/wallet/transactions/?datasource=tranquility`, { headers: esiHeaders }, 9000),
+    ]);
+
+    const rawOrders: {
+      order_id: number;
+      type_id: number;
+      region_id: number;
+      location_id: number;
+      is_buy_order?: boolean;
+      price: number;
+      volume_remain: number;
+      volume_total: number;
+      issued: string;
+    }[] = ordersRes.ok ? ((await ordersRes.json()) as never[]) : [];
+
+    const rawTx: {
+      transaction_id: number;
+      date: string;
+      type_id: number;
+      quantity: number;
+      unit_price: number;
+      is_buy: boolean;
+      location_id: number;
+    }[] = txRes.ok ? ((await txRes.json()) as never[]) : [];
+
+    const idsToResolve = new Set<number>();
+    for (const o of Array.isArray(rawOrders) ? rawOrders : []) {
+      idsToResolve.add(o.type_id);
+      if (o.location_id > 0 && o.location_id < 1_000_000_000) idsToResolve.add(o.location_id);
+    }
+    for (const t of (Array.isArray(rawTx) ? rawTx : []).slice(0, 120)) {
+      idsToResolve.add(t.type_id);
+    }
+    const nameMap = await resolveUniverseNames(Array.from(idsToResolve));
+
+    // Fetch live regional order books for up to 35 unique (region, type, side) combinations
+    const ordersList = (Array.isArray(rawOrders) ? rawOrders : []).slice(0, 60);
+    const uniqueBookKeys = new Map<string, { regionId: number; typeId: number; side: 'sell' | 'buy' }>();
+    for (const o of ordersList) {
+      const side: 'sell' | 'buy' = o.is_buy_order ? 'buy' : 'sell';
+      const key = `${o.region_id}:${o.type_id}:${side}`;
+      if (!uniqueBookKeys.has(key) && uniqueBookKeys.size < 35) {
+        uniqueBookKeys.set(key, { regionId: o.region_id, typeId: o.type_id, side });
+      }
+    }
+
+    const bookResults = new Map<string, EsiMarketOrderRaw[]>();
+    const bookEntries = Array.from(uniqueBookKeys.entries());
+    for (let i = 0; i < bookEntries.length; i += 6) {
+      const batch = bookEntries.slice(i, i + 6);
+      await Promise.all(
+        batch.map(async ([key, reqBook]) => {
+          const rows = await fetchTopRegionalOrders(reqBook.regionId, reqBook.typeId, reqBook.side);
+          bookResults.set(key, rows);
+        })
+      );
+    }
+
+    const orders: OrderMonitorEntry[] = ordersList.map((o) => {
+      const isBuy = Boolean(o.is_buy_order);
+      const side: 'sell' | 'buy' = isBuy ? 'buy' : 'sell';
+      const bookKey = `${o.region_id}:${o.type_id}:${side}`;
+      const book = bookResults.get(bookKey) ?? [];
+      const sameStationCompetitors = book.filter(
+        (b) => b.order_id !== o.order_id && b.location_id === o.location_id
+      );
+      const pool = sameStationCompetitors.length > 0 ? sameStationCompetitors : book.filter((b) => b.order_id !== o.order_id);
+
+      let marketBestPrice = o.price;
+      let competitorsAhead = 0;
+      let isUndercut = false;
+      let suggestedReclaimPrice = o.price;
+
+      if (pool.length > 0) {
+        if (isBuy) {
+          marketBestPrice = Math.max(...pool.map((b) => b.price));
+          competitorsAhead = pool.filter((b) => b.price > o.price).length;
+          if (marketBestPrice > o.price) {
+            isUndercut = true;
+            suggestedReclaimPrice = Number(
+              (marketBestPrice + computeServerEveTick(marketBestPrice)).toFixed(2)
+            );
+          }
+        } else {
+          marketBestPrice = Math.min(...pool.map((b) => b.price));
+          competitorsAhead = pool.filter((b) => b.price < o.price).length;
+          if (marketBestPrice < o.price) {
+            isUndercut = true;
+            suggestedReclaimPrice = Math.max(
+              0.01,
+              Number((marketBestPrice - computeServerEveTick(marketBestPrice)).toFixed(2))
+            );
+          }
+        }
+      }
+
+      const deltaIsk = isUndercut
+        ? Number((suggestedReclaimPrice - o.price).toFixed(2))
+        : 0;
+      const stationName =
+        orderBookStationCache.get(o.location_id) ||
+        nameMap.get(o.location_id) ||
+        (o.location_id >= 1_000_000_000 ? `Upwell Structure #${o.location_id}` : `Station #${o.location_id}`);
+
+      return {
+        orderId: o.order_id,
+        typeId: o.type_id,
+        itemName: nameMap.get(o.type_id) || ITEM_BY_ID[o.type_id]?.name || `Type #${o.type_id}`,
+        regionId: o.region_id,
+        regionName: REGION_LABEL_MAP[o.region_id] || `Region ${o.region_id}`,
+        locationId: o.location_id,
+        stationName,
+        isBuyOrder: isBuy,
+        myPrice: o.price,
+        marketBestPrice,
+        isUndercut,
+        suggestedReclaimPrice,
+        deltaIsk,
+        competitorsAhead,
+        volumeRemain: o.volume_remain,
+        volumeTotal: o.volume_total,
+        issued: o.issued,
+      };
+    });
+
+    orders.sort((a, b) => {
+      if (a.isUndercut !== b.isUndercut) return a.isUndercut ? -1 : 1;
+      return b.myPrice * b.volumeRemain - a.myPrice * a.volumeRemain;
+    });
+
+    const nowMs = Date.now();
+    const dayMs = 24 * 60 * 60 * 1000;
+    const txList = (Array.isArray(rawTx) ? rawTx : []).slice(0, 120);
+
+    const avgBuyCostByType = new Map<number, { cost: number; qty: number }>();
+    for (const t of txList) {
+      if (!t.is_buy) continue;
+      const cur = avgBuyCostByType.get(t.type_id) ?? { cost: 0, qty: 0 };
+      cur.cost += t.unit_price * t.quantity;
+      cur.qty += t.quantity;
+      avgBuyCostByType.set(t.type_id, cur);
+    }
+
+    let realizedRevenue24hIsk = 0;
+    let realizedSpend24hIsk = 0;
+    let realizedProfit24hIsk = 0;
+    let realizedProfit7dIsk = 0;
+
+    const recentTransactions: WalletTransactionEntry[] = txList.slice(0, 50).map((t) => {
+      const totalIsk = t.unit_price * t.quantity;
+      const ageMs = nowMs - Date.parse(t.date);
+      const buyBasis = avgBuyCostByType.get(t.type_id);
+      const unitBasis =
+        buyBasis && buyBasis.qty > 0
+          ? buyBasis.cost / buyBasis.qty
+          : ITEM_BY_ID[t.type_id]?.baseJitaSell ?? t.unit_price * 0.85;
+
+      if (ageMs <= dayMs) {
+        if (t.is_buy) realizedSpend24hIsk += totalIsk;
+        else {
+          realizedRevenue24hIsk += totalIsk;
+          realizedProfit24hIsk += (t.unit_price * 0.95 - unitBasis) * t.quantity;
+        }
+      }
+      if (ageMs <= 7 * dayMs && !t.is_buy) {
+        realizedProfit7dIsk += (t.unit_price * 0.95 - unitBasis) * t.quantity;
+      }
+
+      return {
+        transactionId: t.transaction_id,
+        date: t.date,
+        typeId: t.type_id,
+        itemName: nameMap.get(t.type_id) || ITEM_BY_ID[t.type_id]?.name || `Type #${t.type_id}`,
+        quantity: t.quantity,
+        unitPrice: t.unit_price,
+        totalIsk,
+        isBuy: t.is_buy,
+        locationId: t.location_id,
+      };
+    });
+
+    const payload: OrderMonitorSnapshot = {
+      orders,
+      undercutCount: orders.filter((o) => o.isUndercut).length,
+      recentTransactions,
+      realizedRevenue24hIsk,
+      realizedSpend24hIsk,
+      realizedProfit24hIsk,
+      realizedProfit7dIsk,
+      syncedAt: new Date().toISOString(),
+    };
+
+    res.json(payload);
+  } catch (err) {
+    console.error('ESI order monitor error:', err);
+    res.status(500).json({ error: 'Failed to scan active orders and wallet fills from ESI.' });
   }
 });
 
@@ -2799,11 +3451,22 @@ function stableHashTypeId(name: string): number {
 
 app.post('/api/advisor/chat', async (req, res) => {
   try {
-    const apiKey = process.env.GEMINI_API_KEY;
-    if (!apiKey || apiKey === 'MY_GEMINI_API_KEY') {
-      res.status(503).json({
+    const rawEnvKey = (process.env.GEMINI_API_KEY || '').trim();
+    const envApiKey = rawEnvKey && rawEnvKey !== 'MY_GEMINI_API_KEY' ? rawEnvKey : '';
+    const headerKeyRaw = req.headers['x-gemini-api-key'];
+    const customApiKey =
+      typeof headerKeyRaw === 'string' &&
+      headerKeyRaw.trim().length > 0 &&
+      headerKeyRaw.trim().length <= 256 &&
+      /^[\x21-\x7E]+$/.test(headerKeyRaw.trim())
+        ? headerKeyRaw.trim()
+        : '';
+    const apiKey = envApiKey || customApiKey;
+
+    if (!apiKey) {
+      res.status(400).json({
         error:
-          'GEMINI_API_KEY is not configured on the server. Please configure your Gemini API key in Settings > Secrets.',
+          'No Gemini API key is configured. All market, blueprint, cargo, and route tools work without it — or open "API Setup" in the top navigation bar to add your own optional Gemini API key.',
       });
       return;
     }
