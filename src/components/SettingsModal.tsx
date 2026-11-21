@@ -1,9 +1,9 @@
 import { useEffect, useState } from 'react';
-import { Check, Copy, ExternalLink, KeyRound, Ship, Sliders, X } from 'lucide-react';
+import { Check, Copy, ExternalLink, KeyRound, Ship, Sliders, Sparkles, X } from 'lucide-react';
 import { EVE_ANCHORS } from '../data/eveCatalog.ts';
 import { formatIsk, formatM3 } from '../engines/decisionEngines.ts';
 import { EVE_SSO_SCOPES } from '../utils/evePkce.ts';
-import type { ActionCardData, PilotProfile } from '../types/eve.ts';
+import type { ActionCardData, AiCommentarySettings, PilotProfile } from '../types/eve.ts';
 import { BlueprintLibraryPanel } from './BlueprintLibraryPanel.tsx';
 
 interface SettingsModalProps {
@@ -26,6 +26,8 @@ interface SettingsModalProps {
   onToggleCorpBlueprints: (next: boolean) => void;
   onRescanBlueprints: () => void;
   onOpenHistory: (typeId: number, name: string) => void;
+  aiSettings?: AiCommentarySettings;
+  onChangeAiSettings?: (next: AiCommentarySettings) => void;
 }
 
 const LOCATION_PRESETS = [
@@ -76,6 +78,8 @@ export function SettingsModal({
   onToggleCorpBlueprints,
   onRescanBlueprints,
   onOpenHistory,
+  aiSettings,
+  onChangeAiSettings,
 }: SettingsModalProps) {
   const [tab, setTab] = useState<'sso' | 'profile' | 'assets'>(initialTab);
   const [copiedUri, setCopiedUri] = useState(false);
@@ -560,8 +564,149 @@ export function SettingsModal({
                       <option value={5}>Level V (Entire Region)</option>
                     </select>
                   </div>
+                  <div className="space-y-1">
+                    <div className="flex items-center justify-between text-[11px]">
+                      <label htmlFor="skill-adv-broker" className="text-slate-300 font-medium">
+                        Adv. Broker Relations (ID 3447)
+                      </label>
+                      <span className="font-mono tabular-nums text-amber-300">
+                        Relist Disc: {50 + 6 * (profile.skills.advancedBrokerRelations ?? 0)}%
+                      </span>
+                    </div>
+                    <select
+                      id="skill-adv-broker"
+                      value={profile.skills.advancedBrokerRelations ?? 0}
+                      onChange={(e) =>
+                        onUpdateProfile((prev) => ({
+                          ...prev,
+                          skills: { ...prev.skills, advancedBrokerRelations: Number(e.target.value) },
+                        }))
+                      }
+                      className="w-full bg-[#0b0e14] border border-slate-800 focus:border-cyan-400 focus:outline-none rounded px-2.5 py-1.5 font-mono text-xs text-slate-100"
+                    >
+                      {[0, 1, 2, 3, 4, 5].map((lvl) => (
+                        <option key={lvl} value={lvl}>
+                          Level {lvl} ({50 + 6 * lvl}% Relist Fee Discount)
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+
+                  <div className="space-y-1">
+                    <div className="flex items-center justify-between text-[11px]">
+                      <label htmlFor="skill-adv-indy" className="text-slate-300 font-medium">
+                        Advanced Industry (ID 3388)
+                      </label>
+                      <span className="font-mono tabular-nums text-cyan-300">
+                        -{3 * (profile.skills.advancedIndustry ?? 0)}% Build Time
+                      </span>
+                    </div>
+                    <select
+                      id="skill-adv-indy"
+                      value={profile.skills.advancedIndustry ?? 0}
+                      onChange={(e) =>
+                        onUpdateProfile((prev) => ({
+                          ...prev,
+                          skills: { ...prev.skills, advancedIndustry: Number(e.target.value) },
+                        }))
+                      }
+                      className="w-full bg-[#0b0e14] border border-slate-800 focus:border-cyan-400 focus:outline-none rounded px-2.5 py-1.5 font-mono text-xs text-slate-100"
+                    >
+                      {[0, 1, 2, 3, 4, 5].map((lvl) => (
+                        <option key={lvl} value={lvl}>
+                          Level {lvl} (-{3 * lvl}% Manufacturing Time)
+                        </option>
+                      ))}
+                    </select>
+                  </div>
                 </div>
               </div>
+
+              {/* Optional Enhanced AI Commentary (Bring Your Own API Key - Strictly Browser localStorage) */}
+              {aiSettings && onChangeAiSettings && (
+                <div className="pt-3 border-t border-slate-800/80 space-y-3">
+                  <div className="flex items-start justify-between gap-3">
+                    <div>
+                      <div className="text-slate-200 font-medium flex items-center gap-1.5">
+                        <Sparkles className="w-3.5 h-3.5 text-indigo-400" aria-hidden="true" />
+                        <span>Enhanced AI Market Commentary (Bring Your Own API Key)</span>
+                      </div>
+                      <p className="text-[11px] text-slate-400 mt-0.5">
+                        Price Projection charts &amp; quantitative trend analyzers run 100% locally with 0 API keys. Optionally enable natural-language commentary using your own Gemini or OpenAI key stored strictly in your browser&apos;s <span className="font-mono">localStorage</span> (never stored on the server; uses zero developer tokens).
+                      </p>
+                    </div>
+                    <label className="inline-flex items-center gap-2 shrink-0 cursor-pointer select-none bg-[#131822] border border-slate-800 rounded px-2.5 py-1.5">
+                      <input
+                        type="checkbox"
+                        checked={aiSettings.enabled}
+                        onChange={(e) =>
+                          onChangeAiSettings({ ...aiSettings, enabled: e.target.checked })
+                        }
+                        className="accent-indigo-400 w-3.5 h-3.5 cursor-pointer"
+                      />
+                      <span className="text-[11px] font-semibold text-indigo-200">
+                        Enable BYOK AI
+                      </span>
+                    </label>
+                  </div>
+
+                  {aiSettings.enabled && (
+                    <div className="bg-[#131822] border border-indigo-500/30 rounded-md p-3 space-y-3">
+                      <div className="flex items-center gap-2">
+                        <span className="text-[11px] text-slate-400">Provider:</span>
+                        {(['gemini', 'openai'] as const).map((prov) => (
+                          <button
+                            key={prov}
+                            type="button"
+                            onClick={() => onChangeAiSettings({ ...aiSettings, provider: prov })}
+                            className={`px-2.5 py-1 rounded text-[11px] font-semibold border cursor-pointer transition-colors ${
+                              aiSettings.provider === prov
+                                ? 'bg-indigo-500/20 border-indigo-400/50 text-indigo-200'
+                                : 'bg-[#0b0e14] border-slate-800 text-slate-400 hover:text-slate-200'
+                            }`}
+                          >
+                            {prov === 'gemini' ? 'Google Gemini (BYOK)' : 'OpenAI (BYOK)'}
+                          </button>
+                        ))}
+                      </div>
+
+                      {aiSettings.provider === 'gemini' ? (
+                        <div className="space-y-1">
+                          <label htmlFor="byok-gemini-key" className="block text-[11px] text-slate-300 font-medium">
+                            Your Personal Gemini API Key (Browser localStorage Only)
+                          </label>
+                          <input
+                            id="byok-gemini-key"
+                            type="password"
+                            value={aiSettings.geminiKey}
+                            onChange={(e) =>
+                              onChangeAiSettings({ ...aiSettings, geminiKey: e.target.value })
+                            }
+                            placeholder="AIza..."
+                            className="w-full bg-[#0b0e14] border border-slate-800 focus:border-indigo-400 focus:outline-none rounded px-2.5 py-1.5 font-mono text-xs text-slate-100"
+                          />
+                        </div>
+                      ) : (
+                        <div className="space-y-1">
+                          <label htmlFor="byok-openai-key" className="block text-[11px] text-slate-300 font-medium">
+                            Your Personal OpenAI API Key (Browser localStorage Only)
+                          </label>
+                          <input
+                            id="byok-openai-key"
+                            type="password"
+                            value={aiSettings.openaiKey}
+                            onChange={(e) =>
+                              onChangeAiSettings({ ...aiSettings, openaiKey: e.target.value })
+                            }
+                            placeholder="sk-..."
+                            className="w-full bg-[#0b0e14] border border-slate-800 focus:border-indigo-400 focus:outline-none rounded px-2.5 py-1.5 font-mono text-xs text-slate-100"
+                          />
+                        </div>
+                      )}
+                    </div>
+                  )}
+                </div>
+              )}
 
               <div className="pt-2 border-t border-slate-800/80">
                 <div className="text-slate-300 font-medium mb-2">
@@ -576,7 +721,7 @@ export function SettingsModal({
                   <div>Reprocessing: Lvl {profile.skills.reprocessing}</div>
                   <div>Reproc Eff: Lvl {profile.skills.reprocessingEfficiency}</div>
                   <div>Scrapmetal: Lvl {profile.skills.scrapmetalProcessing}</div>
-                  <div>Indy / Sci: Lvl {profile.skills.industry} / {profile.skills.scienceEncryption}</div>
+                  <div>Indy / Adv: Lvl {profile.skills.industry} / {profile.skills.advancedIndustry ?? 0}</div>
                 </div>
               </div>
             </div>

@@ -26,12 +26,20 @@ import {
   calculateFittedHull,
 } from './src/data/eveFleetCatalog.ts';
 import {
+  esiCachedFetchJson,
+  fetch7DayHistoryStats,
+  getEsiCacheTelemetry,
   getEsiRateLimitState,
   getOrBuildDynamicMarketCatalog,
   scanMarketOrderBatch,
 } from './src/server/esiMarketCatalog.ts';
+import {
+  EVE_USER_AGENT,
+  computeEve4SigFigTick,
+} from './src/utils/eveMarketMath.ts';
 import type {
   AdvisorAction,
+  PriceProjectionAnalysis,
   AdvisorTargetTab,
   AppStateSummary,
   BlueprintEntry,
@@ -99,7 +107,7 @@ async function fetchWithTimeout(url: string, init: RequestInit = {}, timeoutMs =
       signal: controller.signal,
       headers: {
         Accept: 'application/json',
-        'User-Agent': 'FoxyRedFoxIndyCommand/1.0 (AI Studio)',
+        'User-Agent': EVE_USER_AGENT,
         ...(init.headers || {}),
       },
     });
@@ -408,6 +416,7 @@ app.get('/api/market/sync', async (req, res) => {
       liveItemCount: liveCount,
       sourceMode,
       esiRateLimit: getEsiRateLimitState(),
+      cacheTelemetry: getEsiCacheTelemetry('active_sync'),
     };
 
     res.json(snapshot);
@@ -579,7 +588,10 @@ app.post('/api/market/batch', async (req, res) => {
       });
       return;
     }
-    res.json(result);
+    res.json({
+      ...result,
+      cacheTelemetry: getEsiCacheTelemetry('active_sync'),
+    });
   } catch (err) {
     console.error('ESI batch market scan error:', err);
     res.status(500).json({
@@ -1228,47 +1240,84 @@ interface EsiMarketOrderRaw {
 
 interface OrderBookCacheEntry {
   fetchedAt: number;
+  expiresAtMs: number;
   sellOrders: EsiMarketOrderRaw[];
   buyOrders: EsiMarketOrderRaw[];
+  prevTopPrice?: number;
+  from304: boolean;
 }
 const liveOrderBookCache = new Map<string, OrderBookCacheEntry>();
-const ORDER_BOOK_TTL_MS = 45_000;
+const ORDER_BOOK_TTL_MS = 5 * 60 * 1000; // Matches CCP ESI 5-minute market cache
 
 async function fetchTopRegionalOrders(
   regionId: number,
   typeId: number,
-  orderType: 'sell' | 'buy'
-): Promise<EsiMarketOrderRaw[]> {
+  orderType: 'sell' | 'buy',
+  limit = 16
+): Promise<{
+  orders: EsiMarketOrderRaw[];
+  prevTopPrice?: number;
+  expiresAtMs: number;
+  from304: boolean;
+}> {
   const cacheKey = `${regionId}:${typeId}:${orderType}`;
   const cached = liveOrderBookCache.get(cacheKey);
-  if (cached && Date.now() - cached.fetchedAt < ORDER_BOOK_TTL_MS) {
-    return orderType === 'sell' ? cached.sellOrders : cached.buyOrders;
+  if (cached && Date.now() < cached.expiresAtMs) {
+    return {
+      orders: (orderType === 'sell' ? cached.sellOrders : cached.buyOrders).slice(0, limit),
+      prevTopPrice: cached.prevTopPrice,
+      expiresAtMs: cached.expiresAtMs,
+      from304: cached.from304,
+    };
   }
 
   const url = `https://esi.evetech.net/latest/markets/${regionId}/orders/?datasource=tranquility&order_type=${orderType}&type_id=${typeId}`;
-  const res = await fetchWithTimeout(url, {}, 8000);
-  if (!res.ok) return [];
-
-  const rows = (await res.json()) as EsiMarketOrderRaw[];
-  if (!Array.isArray(rows)) return [];
+  const res = await esiCachedFetchJson<EsiMarketOrderRaw[]>(
+    url,
+    {},
+    { timeoutMs: 8000, fallbackTtlMs: ORDER_BOOK_TTL_MS }
+  );
+  if (!res.ok || !Array.isArray(res.data)) {
+    return {
+      orders: cached ? (orderType === 'sell' ? cached.sellOrders : cached.buyOrders).slice(0, limit) : [],
+      prevTopPrice: cached?.prevTopPrice,
+      expiresAtMs: res.expiresAtMs,
+      from304: res.from304,
+    };
+  }
 
   const sorted =
     orderType === 'sell'
-      ? rows
+      ? res.data
           .filter((o) => !o.is_buy_order && o.volume_remain > 0)
           .sort((a, b) => a.price - b.price)
-          .slice(0, 8)
-      : rows
+          .slice(0, 20)
+      : res.data
           .filter((o) => o.is_buy_order && o.volume_remain > 0)
           .sort((a, b) => b.price - a.price)
-          .slice(0, 8);
+          .slice(0, 20);
+
+  const priorTop =
+    orderType === 'sell' ? cached?.sellOrders?.[0]?.price : cached?.buyOrders?.[0]?.price;
+  const newTop = sorted[0]?.price;
+  const prevTopPrice =
+    priorTop && newTop && priorTop !== newTop ? priorTop : cached?.prevTopPrice;
 
   liveOrderBookCache.set(cacheKey, {
     fetchedAt: Date.now(),
+    expiresAtMs: res.expiresAtMs,
     sellOrders: orderType === 'sell' ? sorted : [],
     buyOrders: orderType === 'buy' ? sorted : [],
+    prevTopPrice,
+    from304: res.from304,
   });
-  return sorted;
+
+  return {
+    orders: sorted.slice(0, limit),
+    prevTopPrice,
+    expiresAtMs: res.expiresAtMs,
+    from304: res.from304,
+  };
 }
 
 app.get('/api/market/orderbook', async (req, res) => {
@@ -1285,20 +1334,25 @@ app.get('/api/market/orderbook', async (req, res) => {
     }
 
     const [
-      topSellRaw,
-      topBuyRaw,
+      topSellRes,
+      topBuyRes,
+      buyHistoryStats,
       pilotRegionId,
       buySystemRegionId,
       routeToBuy,
     ] = await Promise.all([
-      fetchTopRegionalOrders(buyRegionId, typeId, 'sell'),
-      fetchTopRegionalOrders(sellRegionId, typeId, 'buy'),
+      fetchTopRegionalOrders(buyRegionId, typeId, 'sell', 12),
+      fetchTopRegionalOrders(sellRegionId, typeId, 'buy', 12),
+      fetch7DayHistoryStats(buyRegionId, typeId),
       pilotSystemId > 0 ? resolveSystemRegionId(pilotSystemId) : Promise.resolve(null),
       buySystemId > 0 ? resolveSystemRegionId(buySystemId) : Promise.resolve(buyRegionId),
       pilotSystemId > 0 && buySystemId > 0
         ? fetchEsiRoutePath(pilotSystemId, buySystemId, 'Shorter', [])
         : Promise.resolve(null),
     ]);
+
+    const topSellRaw = topSellRes.orders;
+    const topBuyRaw = topBuyRes.orders;
 
     // Resolve all unique NPC station names & system names (for Upwell structure fallback labels)
     const npcStationIds = new Set<number>();
@@ -1352,6 +1406,7 @@ app.get('/api/market/orderbook', async (req, res) => {
     const effectiveBuyRegion = buySystemRegionId ?? buyRegionId;
     const sameRegion =
       pilotRegionId !== null ? pilotRegionId === effectiveBuyRegion : undefined;
+    const rl = getEsiRateLimitState();
 
     res.json({
       typeId,
@@ -1367,6 +1422,12 @@ app.get('/api/market/orderbook', async (req, res) => {
       buySystemRegionId: effectiveBuyRegion,
       jumpsToBuySystem: routeToBuy ? routeToBuy.jumps : undefined,
       sameRegion,
+      yesterdayAvgPrice: buyHistoryStats.yesterdayAvgPrice,
+      prevSessionSellMin: topSellRes.prevTopPrice,
+      prevSessionBuyMax: topBuyRes.prevTopPrice,
+      cacheExpiresAt: Math.min(topSellRes.expiresAtMs, topBuyRes.expiresAtMs),
+      ratelimitRemaining: rl.ratelimitRemaining ?? rl.errorLimitRemain,
+      from304Cache: topSellRes.from304 || topBuyRes.from304,
       fetchedAt: new Date().toISOString(),
     });
   } catch (err) {
@@ -1973,12 +2034,15 @@ app.post('/api/eve/sync-character', async (req, res) => {
     const skills = {
       accounting: 5,
       brokerRelations: 5,
+      advancedBrokerRelations: 3,
       procurement: 0,
       marketing: 0,
       reprocessing: 5,
       reprocessingEfficiency: 5,
       scrapmetalProcessing: 5,
       industry: 5,
+      advancedIndustry: 4,
+      reactions: 4,
       scienceEncryption: 5,
       massProduction: 5,
       advancedMassProduction: 4,
@@ -1999,12 +2063,15 @@ app.post('/api/eve/sync-character', async (req, res) => {
       }
       if (skillMap.has(16622)) skills.accounting = skillMap.get(16622)!;
       if (skillMap.has(3446)) skills.brokerRelations = skillMap.get(3446)!;
+      skills.advancedBrokerRelations = skillMap.get(3447) ?? 0;
       skills.procurement = skillMap.get(16596) ?? 0;
       skills.marketing = skillMap.get(16598) ?? 0;
       if (skillMap.has(3385)) skills.reprocessing = skillMap.get(3385)!;
       if (skillMap.has(3389)) skills.reprocessingEfficiency = skillMap.get(3389)!;
       if (skillMap.has(12196)) skills.scrapmetalProcessing = skillMap.get(12196)!;
       if (skillMap.has(3380)) skills.industry = skillMap.get(3380)!;
+      skills.advancedIndustry = skillMap.get(3388) ?? 0;
+      skills.reactions = skillMap.get(45746) ?? 0;
       if (skillMap.has(3402)) skills.scienceEncryption = skillMap.get(3402)!;
       skills.massProduction = skillMap.get(3387) ?? 0;
       skills.advancedMassProduction = skillMap.get(24625) ?? 0;
@@ -2568,12 +2635,7 @@ app.post('/api/eve/industry-jobs', async (req, res) => {
 
 // --- Route 2a-0c: Undercut & Fill Monitor (Active Orders vs Live Order Books + Wallet Transactions Profit) ---
 
-function computeServerEveTick(price: number): number {
-  if (!Number.isFinite(price) || price <= 0) return 0.01;
-  const digits = Math.floor(Math.log10(price)) + 1;
-  if (digits <= 4) return 0.01;
-  return Math.pow(10, digits - 4);
-}
+// Exact 4-significant-figure EVE market tick imported from eveMarketMath.ts (handles power-of-10 boundaries cleanly).
 
 app.post('/api/eve/order-monitor', async (req, res) => {
   try {
@@ -2645,8 +2707,8 @@ app.post('/api/eve/order-monitor', async (req, res) => {
       const batch = bookEntries.slice(i, i + 6);
       await Promise.all(
         batch.map(async ([key, reqBook]) => {
-          const rows = await fetchTopRegionalOrders(reqBook.regionId, reqBook.typeId, reqBook.side);
-          bookResults.set(key, rows);
+          const result = await fetchTopRegionalOrders(reqBook.regionId, reqBook.typeId, reqBook.side, 15);
+          bookResults.set(key, result.orders);
         })
       );
     }
@@ -2672,19 +2734,14 @@ app.post('/api/eve/order-monitor', async (req, res) => {
           competitorsAhead = pool.filter((b) => b.price > o.price).length;
           if (marketBestPrice > o.price) {
             isUndercut = true;
-            suggestedReclaimPrice = Number(
-              (marketBestPrice + computeServerEveTick(marketBestPrice)).toFixed(2)
-            );
+            suggestedReclaimPrice = computeEve4SigFigTick(marketBestPrice, 'outbid_buy');
           }
         } else {
           marketBestPrice = Math.min(...pool.map((b) => b.price));
           competitorsAhead = pool.filter((b) => b.price < o.price).length;
           if (marketBestPrice < o.price) {
             isUndercut = true;
-            suggestedReclaimPrice = Math.max(
-              0.01,
-              Number((marketBestPrice - computeServerEveTick(marketBestPrice)).toFixed(2))
-            );
+            suggestedReclaimPrice = computeEve4SigFigTick(marketBestPrice, 'undercut_sell');
           }
         }
       }
@@ -2783,12 +2840,230 @@ app.post('/api/eve/order-monitor', async (req, res) => {
       realizedProfit24hIsk,
       realizedProfit7dIsk,
       syncedAt: new Date().toISOString(),
+      cacheMeta: getEsiCacheTelemetry('active_sync'),
     };
 
     res.json(payload);
   } catch (err) {
     console.error('ESI order monitor error:', err);
     res.status(500).json({ error: 'Failed to scan active orders and wallet fills from ESI.' });
+  }
+});
+
+// --- Route 2a-0d: Low-Token Background Undercut Watchdog (Polls ONLY open order type_ids via 5-min ETag cache) ---
+
+app.post('/api/eve/undercut-watchdog', async (req, res) => {
+  try {
+    const authHeader = req.headers.authorization || '';
+    const accessToken = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : '';
+    const { characterId } = req.body as { characterId?: number };
+
+    if (!accessToken || !characterId) {
+      res.status(401).json({ error: 'EVE SSO access token and characterId required for watchdog.' });
+      return;
+    }
+
+    const ordersRes = await esiCachedFetchJson<
+      {
+        order_id: number;
+        type_id: number;
+        region_id: number;
+        location_id: number;
+        is_buy_order?: boolean;
+        price: number;
+        volume_remain: number;
+        volume_total: number;
+        issued: string;
+      }[]
+    >(
+      `https://esi.evetech.net/latest/characters/${characterId}/orders/?datasource=tranquility`,
+      { headers: { Authorization: `Bearer ${accessToken}` } },
+      { timeoutMs: 8500, fallbackTtlMs: ORDER_BOOK_TTL_MS, cacheKey: `char-orders:${characterId}` }
+    );
+
+    const rawOrders = Array.isArray(ordersRes.data) ? ordersRes.data : [];
+    const ordersList = rawOrders.slice(0, 45);
+
+    const uniqueBookKeys = new Map<string, { regionId: number; typeId: number; side: 'sell' | 'buy' }>();
+    const idsToResolve = new Set<number>();
+    for (const o of ordersList) {
+      idsToResolve.add(o.type_id);
+      if (o.location_id > 0 && o.location_id < 1_000_000_000) idsToResolve.add(o.location_id);
+      const side: 'sell' | 'buy' = o.is_buy_order ? 'buy' : 'sell';
+      const key = `${o.region_id}:${o.type_id}:${side}`;
+      if (!uniqueBookKeys.has(key) && uniqueBookKeys.size < 30) {
+        uniqueBookKeys.set(key, { regionId: o.region_id, typeId: o.type_id, side });
+      }
+    }
+
+    const nameMap = await resolveUniverseNames(Array.from(idsToResolve));
+    const bookResults = new Map<string, EsiMarketOrderRaw[]>();
+    const bookEntries = Array.from(uniqueBookKeys.entries());
+    for (let i = 0; i < bookEntries.length; i += 6) {
+      const batch = bookEntries.slice(i, i + 6);
+      await Promise.all(
+        batch.map(async ([key, reqBook]) => {
+          const result = await fetchTopRegionalOrders(reqBook.regionId, reqBook.typeId, reqBook.side, 12);
+          bookResults.set(key, result.orders);
+        })
+      );
+    }
+
+    const orders: OrderMonitorEntry[] = ordersList.map((o) => {
+      const isBuy = Boolean(o.is_buy_order);
+      const side: 'sell' | 'buy' = isBuy ? 'buy' : 'sell';
+      const book = bookResults.get(`${o.region_id}:${o.type_id}:${side}`) ?? [];
+      const sameStation = book.filter((b) => b.order_id !== o.order_id && b.location_id === o.location_id);
+      const pool = sameStation.length > 0 ? sameStation : book.filter((b) => b.order_id !== o.order_id);
+
+      let marketBestPrice = o.price;
+      let competitorsAhead = 0;
+      let isUndercut = false;
+      let suggestedReclaimPrice = o.price;
+
+      if (pool.length > 0) {
+        if (isBuy) {
+          marketBestPrice = Math.max(...pool.map((b) => b.price));
+          competitorsAhead = pool.filter((b) => b.price > o.price).length;
+          if (marketBestPrice > o.price) {
+            isUndercut = true;
+            suggestedReclaimPrice = computeEve4SigFigTick(marketBestPrice, 'outbid_buy');
+          }
+        } else {
+          marketBestPrice = Math.min(...pool.map((b) => b.price));
+          competitorsAhead = pool.filter((b) => b.price < o.price).length;
+          if (marketBestPrice < o.price) {
+            isUndercut = true;
+            suggestedReclaimPrice = computeEve4SigFigTick(marketBestPrice, 'undercut_sell');
+          }
+        }
+      }
+
+      const deltaIsk = isUndercut ? Number((suggestedReclaimPrice - o.price).toFixed(2)) : 0;
+      const stationName =
+        orderBookStationCache.get(o.location_id) ||
+        nameMap.get(o.location_id) ||
+        (o.location_id >= 1_000_000_000 ? `Upwell Structure #${o.location_id}` : `Station #${o.location_id}`);
+
+      return {
+        orderId: o.order_id,
+        typeId: o.type_id,
+        itemName: nameMap.get(o.type_id) || ITEM_BY_ID[o.type_id]?.name || `Type #${o.type_id}`,
+        regionId: o.region_id,
+        regionName: REGION_LABEL_MAP[o.region_id] || `Region ${o.region_id}`,
+        locationId: o.location_id,
+        stationName,
+        isBuyOrder: isBuy,
+        myPrice: o.price,
+        marketBestPrice,
+        isUndercut,
+        suggestedReclaimPrice,
+        deltaIsk,
+        competitorsAhead,
+        volumeRemain: o.volume_remain,
+        volumeTotal: o.volume_total,
+        issued: o.issued,
+      };
+    });
+
+    orders.sort((a, b) => {
+      if (a.isUndercut !== b.isUndercut) return a.isUndercut ? -1 : 1;
+      return b.myPrice * b.volumeRemain - a.myPrice * a.volumeRemain;
+    });
+
+    res.json({
+      orders,
+      undercutCount: orders.filter((o) => o.isUndercut).length,
+      syncedAt: new Date().toISOString(),
+      cacheMeta: getEsiCacheTelemetry('background_watchdog'),
+    });
+  } catch (err) {
+    console.error('ESI undercut watchdog error:', err);
+    res.status(500).json({ error: 'Background undercut watchdog failed.' });
+  }
+});
+
+// --- Route 2a-0e: Stateless BYOK AI Price Projection Commentary (0 Developer Tokens Used) ---
+
+app.post('/api/market/projection-commentary', async (req, res) => {
+  try {
+    const geminiKey = String(req.headers['x-gemini-api-key'] || '').trim();
+    const openAiKey = String(req.headers['x-openai-api-key'] || '').trim();
+    const { analysis } = (req.body || {}) as { analysis?: PriceProjectionAnalysis };
+
+    if (!analysis || typeof analysis.itemName !== 'string') {
+      res.status(400).json({ error: 'Valid quantitative market analysis payload is required.' });
+      return;
+    }
+
+    // Strict BYOK guarantee: NEVER fall back to server process.env.GEMINI_API_KEY
+    if (!geminiKey && !openAiKey) {
+      res.status(400).json({
+        error:
+          'No personal API key provided. Enter your own Gemini or OpenAI API key in Settings to enable optional AI market commentary.',
+      });
+      return;
+    }
+
+    const prompt = [
+      'You are an EVE Online industrial & market analyst. Give a crisp, tactical 4-bullet commentary (max 140 words total) based ONLY on these real ESI statistics. No financial hype, no markdown headers.',
+      `Item: ${analysis.itemName} (Type #${analysis.typeId}) in ${analysis.regionName}`,
+      `Current Price: ${analysis.currentAvgPrice.toFixed(2)} ISK | Yesterday Avg: ${analysis.yesterdayAvgPrice.toFixed(2)} ISK (${analysis.change24hPct.toFixed(2)}%)`,
+      `7d MA: ${analysis.ma7d.toFixed(2)} ISK | 30d MA: ${analysis.ma30d.toFixed(2)} ISK | Momentum: ${analysis.momentum7dPct.toFixed(2)}% | 30d Volatility: ${analysis.volatilityPct.toFixed(1)}%`,
+      `Volume Spike Ratio (7d/30d): ${analysis.volumeSpikeRatio.toFixed(2)}x | Thin/Manipulation Risk: ${analysis.manipulationRisk} (${analysis.manipulationNotes.join('; ') || 'none'})`,
+      `Statistical 7d Range: ${analysis.projected7dLow.toFixed(2)} - ${analysis.projected7dHigh.toFixed(2)} ISK (Signal: ${analysis.signal})`,
+    ].join('\n');
+
+    if (geminiKey) {
+      const ai = new GoogleGenAI({ apiKey: geminiKey });
+      const response = await ai.models.generateContent({
+        model: 'gemini-4-hydrogen',
+        contents: prompt,
+      });
+      const text = (response.text || '').trim();
+      res.json({
+        provider: 'gemini',
+        commentary: text || 'No commentary generated.',
+      });
+      return;
+    }
+
+    // OpenAI BYOK path (transient key, never persisted or logged)
+    const oaiRes = await fetch('https://api.openai.com/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${openAiKey}`,
+      },
+      body: JSON.stringify({
+        model: 'gpt-4o-mini',
+        temperature: 0.3,
+        max_tokens: 260,
+        messages: [
+          {
+            role: 'system',
+            content: 'You are a concise EVE Online market analyst. Respond in 4 short tactical bullet points.',
+          },
+          { role: 'user', content: prompt },
+        ],
+      }),
+    });
+    if (!oaiRes.ok) {
+      res.status(oaiRes.status).json({
+        error: `OpenAI API returned HTTP ${oaiRes.status}. Verify your personal OpenAI API key in Settings.`,
+      });
+      return;
+    }
+    const oaiJson = (await oaiRes.json()) as {
+      choices?: { message?: { content?: string } }[];
+    };
+    const commentary = oaiJson.choices?.[0]?.message?.content?.trim() || 'No commentary generated.';
+    res.json({ provider: 'openai', commentary });
+  } catch (err) {
+    console.error('BYOK projection commentary error:', err instanceof Error ? err.message : 'Unknown error');
+    res.status(502).json({
+      error: 'Unable to generate BYOK AI commentary. Verify your personal API key in Settings.',
+    });
   }
 });
 

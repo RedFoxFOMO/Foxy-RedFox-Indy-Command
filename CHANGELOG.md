@@ -6,6 +6,38 @@ The format follows [Semantic Versioning](https://semver.org/):
 - **MINOR** (`1.0.0` -> `1.1.0`) for new features.
 - **PATCH** (`1.1.0` -> `1.1.1`) for fixes, refinements, and tweaks.
 
+## [2.1.0] - 2026-11-20
+
+### Added
+- **ESI Rate-Limit & Cache Shield (Active Sync vs. Low-Token Background Watchdog)**:
+  - Standardized all ESI fetchers and serverless proxies on the descriptive `User-Agent: Foxy-RedFox-Indy-Command/2.1.0 (+https://github.com/RedFoxFOMO/Foxy-RedFox-Indy-Command)`.
+  - Enforced CCP's 5-minute market cache (`Cache-Control` / `Expires`) so fresh cached endpoints consume **0 API tokens**, and added `If-None-Match` (`ETag`) conditional revalidation on expiry so `304 Not Modified` responses consume **1 token instead of 2**.
+  - Added live `X-Ratelimit-Remaining` / `Retry-After` telemetry and a live **"Market Cache Refresh"** countdown badge in the top bar.
+  - Added `document.hidden` visibility throttling: hidden tabs pause general market browsing and history polling while keeping a lightweight **"Undercut Watchdog"** running on the 5-minute schedule strictly for the `type_id`s of open character orders.
+- **True Orderbook Depth-Walking Cost & Revenue Engine**:
+  - Replaced top-of-book estimates with live ascending sell-order walking for buying inputs (weighted-average unit price, total ISK, slippage %, shortfall warnings) and descending buy-order walking (respecting `min_volume` and `volume_remain`) for instant-selling outputs.
+- **Interactive Quantity / Runs Slicer (Single Source of Truth)**:
+  - Added editable `Qty / Runs` numeric inputs, `−` / `+` steppers, and a **"Max Profitable"** reset button on trade and blueprint cards with zero-ESI-refetch client-side recalculation of depth-walked cost/revenue, net profit, ISK/hour, cargo volume m³, and slot duration.
+  - Automatically propagates committed quantities into the Build Queue, Multi-Buy Shopping List, and Hauling Route Planner.
+- **Dual Profit Modes ("Buy All" vs. "Buy Missing") & Virtual Hangar Stock Ledger**:
+  - Displays side-by-side **Buy All (Replacement Cost)** and **Buy Missing (Cash Out-of-Pocket)** profits on blueprint cards.
+  - Added a priority-ordered **Multi-Slot Build Queue & Virtual Hangar Stock Ledger** showing `Reserved / Available` per material row across stacked jobs, automatically cascading depleted hangar stock into Buy Missing requirements.
+- **Skill- & Location-Specific Blueprint Time & Multi-Slot Concurrency Planner**:
+  - Syncs live ESI skills (`Industry`, `Advanced Industry`, `Reactions`, `Mass Production`, `Advanced Mass Production`, `Laboratory Operation`, `Advanced Laboratory Operation`, `Advanced Broker Relations`), Blueprint ME/TE, active job counts, and Upwell structure/rig bonuses (**NPC Station, Raitaru, Azbel, Sotiyo, Athanor, Tatara**).
+  - Lets pilots allocate concurrent slots per job to view **1-Slot Sequential Time**, **Time Per Slot**, and **Concurrent Wall-Clock Time** alongside live ISK/hour.
+- **Hauling Route Planner, Smart Hull Suggester & Multi-Buy Fit Flyout**:
+  - Added slide-over **Hauler & Fit** flyout showing raw material m³, packaged output m³, ESI jump count & security checks, owned hauler trip counts from ESI assets, optimal hull class recommendations (`T1 Industrial`, `Blockade Runner`, `DST`, `Freighter`) with gank-risk rationale, live Jita hull+fit pricing, and one-click **"Copy Hull + Fit for EVE Multi-Buy"**.
+- **Exact 4-Sig-Fig Tick Undercutter & Relist Cost Preview**:
+  - Added one-click **"Copy Tick Price"** next to competitor prices computing the exact next valid 4-significant-figure EVE tick (e.g., `1,000,000 -> 999,900`, `99.99 -> 99.98`), exact skill-adjusted relist modification fee (`Broker Relations` + `Advanced Broker Relations`, 100 ISK minimum), updated net margin, and an unprofitable-relist alert.
+- **Availability-Checked Global Multi-Buy Aggregator**:
+  - Added **"Export Total Shopping List"** modal at the bottom of the multi-slot build queue combining all Buy Missing materials across queued jobs, auditing live hub orderbook stock (`In Stock`, `Thin Depth / Price Spike`, `Shortfall`), and isolating thin-orderbook materials from safe bulk Multi-Buy exports.
+- **Dual Trend Arrows in Market Depth & Price Projection Pop-Out**:
+  - Added dual directional price indicators inside **Market Depth** (`LiveOrderBookPanel`): a large saturated arrow (`#10B981` / `#EF4444`) for 24h trend vs. yesterday's ESI average plus a smaller soft pastel arrow (`#86EFAC` / `#FCA5A5`) for the recent 5-minute session tick.
+  - Added a **Price Projection Pop-Out** modal accessible from Pinned Watchlist, Category SKU Inspector, and Action Cards featuring a 0-API-key client-side quantitative analyzer (7d/30d MAs, momentum, volume spikes, thin-market checks) and an optional **Bring Your Own API Key** AI commentary mode (Gemini or OpenAI, stored strictly in browser `localStorage`).
+- **Workspace UI Refinements**:
+  - Added a click-and-drag resizable vertical split-pane divider between the center workspace and right docked panel (with double-click 50/50 reset and `localStorage` persistence).
+  - Enhanced active top-navigation tab elevation (raised drop-shadow, border highlight, bottom accent indicator) and persistent selected-row / selected-card styling (left cyan accent bar, soft tint, subtle inner shadow).
+
 ## [2.0.0] - 2026-11-20
 
 ### Added

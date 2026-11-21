@@ -45,7 +45,13 @@ async function fetchFuzzworkStation(
     try {
       const r = await fetch(
         `https://market.fuzzwork.co.uk/aggregates/?station=${stationId}&types=${chunk.join(',')}`,
-        { headers: { Accept: 'application/json', 'User-Agent': 'FoxyRedFoxIndyCommand/2.0' } }
+        {
+          headers: {
+            Accept: 'application/json',
+            'User-Agent':
+              'Foxy-RedFox-Indy-Command/2.1.0 (+https://github.com/RedFoxFOMO/Foxy-RedFox-Indy-Command)',
+          },
+        }
       );
       if (!r.ok) continue;
       const json = (await r.json()) as Record<string, FuzzworkAgg>;

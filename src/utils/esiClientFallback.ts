@@ -3,10 +3,12 @@
 // whenever an Express endpoint is unavailable, while keeping Express primary on Cloud Run.
 
 import { EMPIRE_HUB_MAP, EVE_ANCHORS } from '../data/eveCatalog.ts';
+import { computeEve4SigFigTick } from './eveMarketMath.ts';
 import type {
   CharacterIndustryJob,
   HubQuote,
   IndustryCostSnapshot,
+  MarketCacheTelemetry,
   MarketQuote,
   MarketSnapshot,
   OrderMonitorEntry,
@@ -34,11 +36,7 @@ export const ACTIVITY_LABEL_MAP: Record<number, string> = {
  * Returns the exact next valid price tick above (for buy) or below (for sell) targetPrice.
  */
 export function computeEveMarketTick(price: number, direction: 'undercut_sell' | 'outbid_buy'): number {
-  if (!Number.isFinite(price) || price <= 0) return 0.01;
-  const magnitude = Math.floor(Math.log10(price));
-  const step = Math.max(0.01, Math.pow(10, magnitude - 3));
-  const next = direction === 'undercut_sell' ? price - step : price + step;
-  return Math.max(0.01, Number(next.toFixed(2)));
+  return computeEve4SigFigTick(price, direction);
 }
 
 export async function fetchIndustryCostIndicesClient(): Promise<IndustryCostSnapshot> {
@@ -544,5 +542,57 @@ export async function fetchOrderMonitorClient(
     realizedProfit24hIsk,
     realizedProfit7dIsk,
     syncedAt: new Date().toISOString(),
+  };
+}
+
+/**
+ * Low-token background Undercut Watchdog.
+ * Polls ONLY the character's open market order type_ids respecting ESI's 5-minute ETag cache.
+ */
+export async function pollUndercutWatchdogClient(
+  characterId: number,
+  accessToken: string,
+  salesTaxRate: number
+): Promise<{
+  orders: OrderMonitorEntry[];
+  undercutCount: number;
+  syncedAt: string;
+  cacheMeta?: MarketCacheTelemetry;
+}> {
+  try {
+    const apiRes = await fetch('/api/eve/undercut-watchdog', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${accessToken}`,
+      },
+      body: JSON.stringify({ characterId }),
+    });
+    if (apiRes.ok) {
+      return (await apiRes.json()) as {
+        orders: OrderMonitorEntry[];
+        undercutCount: number;
+        syncedAt: string;
+        cacheMeta?: MarketCacheTelemetry;
+      };
+    }
+  } catch {
+    // Fall back to full client monitor if serverless lacks watchdog route
+  }
+
+  const full = await fetchOrderMonitorClient(characterId, accessToken, salesTaxRate);
+  return {
+    orders: full.orders,
+    undercutCount: full.undercutCount,
+    syncedAt: full.syncedAt,
+    cacheMeta: {
+      expiresAtMs: Date.now() + 5 * 60 * 1000,
+      lastRefreshedAt: full.syncedAt,
+      ratelimitRemaining: null,
+      retryAfterSec: null,
+      from304Count: 0,
+      zeroTokenHits: 0,
+      mode: 'background_watchdog',
+    },
   };
 }

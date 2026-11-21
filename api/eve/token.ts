@@ -55,7 +55,8 @@ export default async function handler(req: ServerlessReq, res: ServerlessRes) {
       headers: {
         'Content-Type': 'application/x-www-form-urlencoded',
         Accept: 'application/json',
-        'User-Agent': 'FoxyRedFoxIndyCommand/2.0',
+        'User-Agent':
+          'Foxy-RedFox-Indy-Command/2.1.0 (+https://github.com/RedFoxFOMO/Foxy-RedFox-Indy-Command)',
       },
       body: form.toString(),
     });

@@ -7,6 +7,7 @@ import {
   Pin,
   Plus,
   Search,
+  Sparkles,
   Trash2,
 } from 'lucide-react';
 import { EMPIRE_HUB_MAP, EVE_ITEMS, ITEM_BY_ID } from '../data/eveCatalog.ts';
@@ -38,6 +39,12 @@ interface WatchlistPanelProps {
   onUpdateWatchlistItem: (typeId: number, patch: Partial<WatchlistItem>) => void;
   onRemoveWatchlistItem: (typeId: number) => void;
   onOpenHistory: (typeId: number, name: string) => void;
+  onOpenPriceProjection?: (target: {
+    typeId: number;
+    itemName: string;
+    regionId?: number;
+    currentPrice?: number;
+  }) => void;
 }
 
 export function WatchlistPanel({
@@ -51,9 +58,11 @@ export function WatchlistPanel({
   onUpdateWatchlistItem,
   onRemoveWatchlistItem,
   onOpenHistory,
+  onOpenPriceProjection,
 }: WatchlistPanelProps) {
   const [collapsed, toggleCollapsed] = useCollapsibleCard('panel-watchlist', false);
   const [pickerQuery, setPickerQuery] = useState('');
+  const [selectedTypeId, setSelectedTypeId] = useState<number | null>(null);
 
   const srcMeta = EMPIRE_HUB_MAP[sourceHub];
   const dstMeta = EMPIRE_HUB_MAP[destHub];
@@ -228,13 +237,18 @@ export function WatchlistPanel({
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-slate-800/60">
-                  {evaluatedRows.map((row) => (
+                  {evaluatedRows.map((row) => {
+                    const isSelected = selectedTypeId === row.item.typeId;
+                    return (
                     <tr
                       key={row.item.typeId}
+                      onClick={() => setSelectedTypeId(row.item.typeId)}
                       className={
-                        row.triggered
-                          ? 'bg-emerald-500/10 hover:bg-emerald-500/15 transition-colors'
-                          : 'hover:bg-slate-800/30 transition-colors'
+                        isSelected
+                          ? 'bg-cyan-500/[0.09] shadow-[inset_3px_0_0_#22d3ee,inset_0_1px_0_rgba(34,211,238,0.12)] transition-colors cursor-pointer'
+                          : row.triggered
+                            ? 'bg-emerald-500/10 hover:bg-emerald-500/15 transition-colors cursor-pointer'
+                            : 'hover:bg-slate-800/30 transition-colors cursor-pointer'
                       }
                     >
                       <td className="py-2 px-4 font-medium text-slate-100 whitespace-nowrap">
@@ -308,8 +322,25 @@ export function WatchlistPanel({
                           <span className="font-mono text-[10px] text-slate-500">Watching</span>
                         )}
                       </td>
-                      <td className="py-2 px-4 text-right whitespace-nowrap">
+                      <td className="py-2 px-4 text-right whitespace-nowrap" onClick={(e) => e.stopPropagation()}>
                         <div className="inline-flex items-center gap-1.5">
+                          {onOpenPriceProjection && (
+                            <button
+                              type="button"
+                              onClick={() =>
+                                onOpenPriceProjection({
+                                  typeId: row.item.typeId,
+                                  itemName: row.item.name,
+                                  regionId: dstMeta.regionId,
+                                  currentPrice: row.sellPrice,
+                                })
+                              }
+                              title={`Price projection & momentum analysis for ${row.item.name}`}
+                              className="p-1 rounded text-indigo-300 hover:text-indigo-200 hover:bg-indigo-500/20 transition-colors cursor-pointer"
+                            >
+                              <Sparkles className="w-3.5 h-3.5" />
+                            </button>
+                          )}
                           <button
                             type="button"
                             onClick={() => onOpenHistory(row.item.typeId, row.item.name)}
@@ -329,7 +360,8 @@ export function WatchlistPanel({
                         </div>
                       </td>
                     </tr>
-                  ))}
+                    );
+                  })}
                 </tbody>
               </table>
             </div>

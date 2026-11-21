@@ -22,6 +22,8 @@ const STRUCTURE_OPTIONS: { id: IndustryStructureType; label: string; tag: string
   { id: 'raitaru', label: 'Raitaru (M)', tag: '-1% ME · -3% Cost · -15% TE' },
   { id: 'azbel', label: 'Azbel (L)', tag: '-1% ME · -4% Cost · -20% TE' },
   { id: 'sotiyo', label: 'Sotiyo (XL)', tag: '-1% ME · -5% Cost · -30% TE' },
+  { id: 'athanor', label: 'Athanor (M)', tag: 'Refinery · -2% Cost · -15% TE' },
+  { id: 'tatara', label: 'Tatara (L)', tag: 'Refinery · -4% Cost · -25% TE' },
 ];
 
 const RIG_TIERS: { id: RigTier; label: string }[] = [

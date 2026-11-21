@@ -1,5 +1,6 @@
-import { Activity, KeyRound, RefreshCw, Route } from 'lucide-react';
-import type { EngineId } from '../types/eve.ts';
+import { useEffect, useState } from 'react';
+import { Activity, Clock, KeyRound, RefreshCw, Route, ShieldCheck } from 'lucide-react';
+import type { EngineId, MarketCacheTelemetry } from '../types/eve.ts';
 
 import { formatCooldownDuration } from '../utils/marketCatalogCache.ts';
 
@@ -15,6 +16,7 @@ interface TopBarProps {
   isSyncing: boolean;
   marketCooldownRemainingSec: number;
   isRateLimitPaused: boolean;
+  cacheTelemetry?: MarketCacheTelemetry | null;
   routePanelOpen: boolean;
   queuedRouteCount: number;
   onToggleRoutePanel: () => void;
@@ -40,6 +42,7 @@ export function TopBar({
   isSyncing,
   marketCooldownRemainingSec,
   isRateLimitPaused,
+  cacheTelemetry,
   routePanelOpen,
   queuedRouteCount,
   onToggleRoutePanel,
@@ -47,9 +50,39 @@ export function TopBar({
   hasEveClientId,
 }: TopBarProps) {
   const syncDisabled = isSyncing || marketCooldownRemainingSec > 0 || isRateLimitPaused;
+  const [cacheRemainSec, setCacheRemainSec] = useState<number>(0);
+
+  useEffect(() => {
+    const updateCountdown = () => {
+      if (!cacheTelemetry?.expiresAtMs) {
+        setCacheRemainSec(0);
+        return;
+      }
+      const diff = Math.max(0, Math.ceil((cacheTelemetry.expiresAtMs - Date.now()) / 1000));
+      setCacheRemainSec(diff);
+    };
+    updateCountdown();
+    const id = window.setInterval(updateCountdown, 1000);
+    return () => window.clearInterval(id);
+  }, [cacheTelemetry?.expiresAtMs]);
+
+  const cacheTooltip = cacheTelemetry
+    ? [
+        `ESI 5-Min Cache Shield (${cacheTelemetry.mode === 'background_watchdog' ? 'Low-Token Watchdog' : 'Active Sync'})`,
+        cacheRemainSec > 0
+          ? `Cache fresh for ${formatCooldownDuration(cacheRemainSec)} (0 ESI tokens)`
+          : 'Cache window ready for ETag (304) revalidation',
+        cacheTelemetry.ratelimitRemaining !== null
+          ? `X-Ratelimit-Remaining: ${cacheTelemetry.ratelimitRemaining}`
+          : null,
+        `304 Not Modified saves: ${cacheTelemetry.from304Count} · 0-token hits: ${cacheTelemetry.zeroTokenHits}`,
+      ]
+        .filter(Boolean)
+        .join(' | ')
+    : 'ESI 5-Minute Cache & ETag (304) Shield Active';
 
   return (
-    <header className="h-14 px-6 bg-[#0d1118] border-b border-slate-800/90 flex items-center justify-between gap-4 shrink-0">
+    <header className="h-14 px-5 bg-[#0d1118] border-b border-slate-800/90 flex items-center justify-between gap-3 shrink-0">
       {/* Zone 1: Single-line Brand Wordmark */}
       <button
         type="button"
@@ -59,10 +92,10 @@ export function TopBar({
         Foxy RedFox Indy Command
       </button>
 
-      {/* Zone 2: Clean Single-Line Navigation Links + Order Monitor Overlay Tab */}
+      {/* Zone 2: Navigation Tabs with Raised Active Shadow & Accent Indicator */}
       <nav
         aria-label="Decision Engines"
-        className="hidden lg:flex items-center gap-5 h-full"
+        className="hidden lg:flex items-center gap-1.5 h-full py-2"
       >
         {NAV_ITEMS.map((item) => {
           const isActive = activeView === item.id && !orderMonitorOpen;
@@ -71,13 +104,19 @@ export function TopBar({
               key={item.id}
               type="button"
               onClick={() => onSelectView(item.id)}
-              className={`h-full inline-flex items-center text-sm font-medium border-b-2 transition-colors whitespace-nowrap shrink-0 cursor-pointer focus-visible:outline-none focus-visible:text-cyan-300 ${
+              className={`relative h-full px-3 rounded-md inline-flex items-center text-sm font-medium transition-all whitespace-nowrap shrink-0 cursor-pointer focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-400 ${
                 isActive
-                  ? 'border-cyan-400 text-cyan-300'
-                  : 'border-transparent text-slate-400 hover:text-slate-100'
+                  ? 'bg-[#162030] text-cyan-200 border border-cyan-400/50 shadow-[0_4px_14px_rgba(34,211,238,0.20),inset_0_1px_0_rgba(165,243,252,0.18)] -translate-y-[1px]'
+                  : 'border border-transparent text-slate-400 hover:text-slate-100 hover:bg-slate-800/40'
               }`}
             >
-              {item.label}
+              <span>{item.label}</span>
+              {isActive && (
+                <span
+                  aria-hidden="true"
+                  className="absolute left-2 right-2 -bottom-[1px] h-[2px] rounded-full bg-cyan-400 shadow-[0_0_8px_rgba(34,211,238,0.8)]"
+                />
+              )}
             </button>
           );
         })}
@@ -87,10 +126,10 @@ export function TopBar({
           onClick={onOpenOrderMonitor}
           aria-pressed={orderMonitorOpen}
           title="Open Order Monitor overlay for live undercut detection and 24h/7d realized profit"
-          className={`h-full inline-flex items-center gap-1.5 text-sm font-medium border-b-2 transition-colors whitespace-nowrap shrink-0 cursor-pointer focus-visible:outline-none focus-visible:text-cyan-300 ${
+          className={`relative h-full px-3 rounded-md inline-flex items-center gap-1.5 text-sm font-medium transition-all whitespace-nowrap shrink-0 cursor-pointer focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-amber-400 ${
             orderMonitorOpen
-              ? 'border-amber-400 text-amber-300'
-              : 'border-transparent text-slate-400 hover:text-slate-100'
+              ? 'bg-[#221b12] text-amber-200 border border-amber-400/55 shadow-[0_4px_14px_rgba(251,191,36,0.22),inset_0_1px_0_rgba(253,230,138,0.2)] -translate-y-[1px]'
+              : 'border border-transparent text-slate-400 hover:text-slate-100 hover:bg-slate-800/40'
           }`}
         >
           <Activity className="w-3.5 h-3.5" aria-hidden="true" />
@@ -100,11 +139,39 @@ export function TopBar({
               {undercutCount}
             </span>
           )}
+          {orderMonitorOpen && (
+            <span
+              aria-hidden="true"
+              className="absolute left-2 right-2 -bottom-[1px] h-[2px] rounded-full bg-amber-400 shadow-[0_0_8px_rgba(251,191,36,0.8)]"
+            />
+          )}
         </button>
       </nav>
 
-      {/* Zone 3: Order Monitor (mobile) + API Setup + Route Optimizer Toggle + Sync Live Markets */}
+      {/* Zone 3: Live Market Cache Shield Badge + API Setup + Route Optimizer Toggle + Refresh */}
       <div className="flex items-center gap-2 shrink-0">
+        {/* Live Market Cache Refresh Countdown Badge */}
+        <div
+          title={cacheTooltip}
+          className="hidden xl:inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-md border border-slate-800 bg-[#101622] text-[11px] font-mono tabular-nums text-slate-300"
+        >
+          {cacheTelemetry?.mode === 'background_watchdog' ? (
+            <ShieldCheck className="w-3.5 h-3.5 text-amber-400 shrink-0" aria-hidden="true" />
+          ) : (
+            <Clock className="w-3.5 h-3.5 text-emerald-400 shrink-0" aria-hidden="true" />
+          )}
+          <span className="text-slate-400">Cache</span>
+          <span className={cacheRemainSec > 0 ? 'text-emerald-300 font-semibold' : 'text-cyan-300'}>
+            {cacheRemainSec > 0 ? formatCooldownDuration(cacheRemainSec) : 'Ready'}
+          </span>
+          {cacheTelemetry?.ratelimitRemaining !== null &&
+            cacheTelemetry?.ratelimitRemaining !== undefined && (
+              <span className="text-slate-500 border-l border-slate-700 pl-1.5">
+                RL:{cacheTelemetry.ratelimitRemaining}
+              </span>
+            )}
+        </div>
+
         <button
           type="button"
           onClick={onOpenOrderMonitor}
@@ -125,8 +192,8 @@ export function TopBar({
           onClick={onOpenApiSetup}
           title={
             hasEveClientId
-              ? 'Manage EVE Client ID, Callback URL, and optional Gemini API key'
-              : 'Configure your EVE Client ID and optional Gemini API key (no terminal needed)'
+              ? 'Manage EVE Client ID, Callback URL, and optional BYOK AI keys'
+              : 'Configure your EVE Client ID and optional BYOK AI keys (no terminal needed)'
           }
           className={`inline-flex items-center gap-1.5 px-3 py-2 text-xs font-medium rounded-md border transition-colors whitespace-nowrap shrink-0 cursor-pointer focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-400 ${
             hasEveClientId
@@ -144,7 +211,7 @@ export function TopBar({
           aria-pressed={routePanelOpen}
           className={`inline-flex items-center gap-2 px-3 py-2 text-xs font-medium rounded-md border transition-colors whitespace-nowrap shrink-0 cursor-pointer focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-400 ${
             routePanelOpen
-              ? 'bg-cyan-500/20 text-cyan-200 border-cyan-400/60'
+              ? 'bg-cyan-500/20 text-cyan-200 border-cyan-400/60 shadow-[0_2px_10px_rgba(34,211,238,0.18)]'
               : queuedRouteCount > 0
                 ? 'bg-[#131822] text-cyan-300 border-cyan-500/40 hover:bg-cyan-500/10'
                 : 'bg-[#131822] text-slate-300 border-slate-700/90 hover:border-slate-600 hover:text-slate-100'
@@ -165,7 +232,7 @@ export function TopBar({
               ? `CCP ESI caches market orders for 5 minutes (${formatCooldownDuration(marketCooldownRemainingSec)} remaining)`
               : 'Refresh live 5-Hub Empire market orders from EVE ESI'
           }
-          className="inline-flex items-center gap-2 px-4 py-2 text-xs font-medium rounded-md bg-cyan-500/15 text-cyan-200 border border-cyan-400/40 hover:bg-cyan-500/25 disabled:opacity-55 disabled:cursor-not-allowed transition-colors whitespace-nowrap shrink-0 cursor-pointer focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-400"
+          className="inline-flex items-center gap-2 px-3.5 py-2 text-xs font-medium rounded-md bg-cyan-500/15 text-cyan-200 border border-cyan-400/40 hover:bg-cyan-500/25 disabled:opacity-55 disabled:cursor-not-allowed transition-colors whitespace-nowrap shrink-0 cursor-pointer focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-400"
         >
           <RefreshCw
             className={`w-3.5 h-3.5 ${isSyncing ? 'animate-spin' : ''}`}
@@ -185,3 +252,4 @@ export function TopBar({
     </header>
   );
 }
+

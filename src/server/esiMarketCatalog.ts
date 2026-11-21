@@ -5,19 +5,22 @@ import {
   ITEM_BY_ID,
   MARKET_CATEGORIES,
 } from '../data/eveCatalog.ts';
+import { EVE_USER_AGENT } from '../utils/eveMarketMath.ts';
 import type {
   CatalogSku,
   CorridorOrder,
   DynamicMarketCatalog,
   EsiRateLimitState,
+  MarketCacheTelemetry,
   MarketCategoryId,
   MarketQuote,
+  OrderBookLevel,
 } from '../types/eve.ts';
 
 const CATALOG_SCHEMA_VERSION = 2;
 const CATALOG_TTL_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
 const ORDER_CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes (matches CCP ESI cache)
-const ESI_USER_AGENT = 'FoxyRedFoxIndyCommand/1.0 (AI Studio)';
+const ESI_USER_AGENT = EVE_USER_AGENT;
 
 // --- Centralized ESI Rate-Limit & Error-Budget Tracker ---
 
@@ -120,6 +123,201 @@ export async function esiFetchTracked(
   } finally {
     clearTimeout(timer);
   }
+}
+
+// --- v2.1.0 ESI 5-Minute Cache & ETag (If-None-Match / 304 Not Modified) Shield ---
+
+interface EsiHttpCacheRecord {
+  data: unknown;
+  etag?: string;
+  expiresAtMs: number;
+  fetchedAtMs: number;
+}
+
+const esiHttpCache = new Map<string, EsiHttpCacheRecord>();
+const esiTelemetryState = {
+  from304Count: 0,
+  zeroTokenHits: 0,
+  lastRefreshedAt: new Date().toISOString(),
+  nextExpiresAtMs: Date.now() + ORDER_CACHE_TTL_MS,
+};
+
+function parseCacheExpiryMs(res: Response, fallbackTtlMs: number): number {
+  const now = Date.now();
+  const cacheControl = res.headers.get('cache-control') || '';
+  const maxAgeMatch = cacheControl.match(/max-age=(\d+)/i);
+  if (maxAgeMatch) {
+    const sec = Number(maxAgeMatch[1]);
+    if (Number.isFinite(sec) && sec > 0) {
+      return now + sec * 1000;
+    }
+  }
+  const expiresHeader = res.headers.get('expires');
+  if (expiresHeader) {
+    const parsed = Date.parse(expiresHeader);
+    if (Number.isFinite(parsed) && parsed > now) {
+      return parsed;
+    }
+  }
+  return now + fallbackTtlMs;
+}
+
+export function getEsiCacheTelemetry(
+  mode: MarketCacheTelemetry['mode'] = 'active_sync'
+): MarketCacheTelemetry {
+  const rl = getEsiRateLimitState();
+  return {
+    expiresAtMs: esiTelemetryState.nextExpiresAtMs,
+    lastRefreshedAt: esiTelemetryState.lastRefreshedAt,
+    ratelimitRemaining: rl.ratelimitRemaining ?? rl.errorLimitRemain,
+    retryAfterSec: rl.retryAfterSec,
+    from304Count: esiTelemetryState.from304Count,
+    zeroTokenHits: esiTelemetryState.zeroTokenHits,
+    mode,
+  };
+}
+
+export interface EsiCachedFetchResult<T> {
+  ok: boolean;
+  status: number;
+  data: T | null;
+  fromCache: boolean;
+  from304: boolean;
+  expiresAtMs: number;
+  etag?: string;
+}
+
+/**
+ * Fetches an ESI JSON endpoint respecting CCP's Expires / Cache-Control window (0 tokens while fresh)
+ * and sending If-None-Match (ETag) upon expiry so 304 Not Modified consumes 1 token instead of 2.
+ */
+export async function esiCachedFetchJson<T>(
+  url: string,
+  init: RequestInit = {},
+  options: { timeoutMs?: number; fallbackTtlMs?: number; forceRevalidate?: boolean; cacheKey?: string } = {}
+): Promise<EsiCachedFetchResult<T>> {
+  const fallbackTtlMs = options.fallbackTtlMs ?? ORDER_CACHE_TTL_MS;
+  const timeoutMs = options.timeoutMs ?? 7500;
+  const cacheKey = options.cacheKey ?? url;
+  const now = Date.now();
+  const cached = esiHttpCache.get(cacheKey);
+
+  // 1. Fresh within CCP Expires/Cache-Control window -> 0 ESI tokens consumed!
+  if (!options.forceRevalidate && cached && now < cached.expiresAtMs) {
+    esiTelemetryState.zeroTokenHits += 1;
+    return {
+      ok: true,
+      status: 200,
+      data: cached.data as T,
+      fromCache: true,
+      from304: false,
+      expiresAtMs: cached.expiresAtMs,
+      etag: cached.etag,
+    };
+  }
+
+  // 2. Expired (or forced revalidate) -> send If-None-Match if we have an ETag (304 = 1 token vs 2)
+  const reqHeaders: Record<string, string> = {
+    Accept: 'application/json',
+    'User-Agent': ESI_USER_AGENT,
+    ...(init.headers as Record<string, string> | undefined),
+  };
+  if (cached?.etag) {
+    reqHeaders['If-None-Match'] = cached.etag;
+  }
+
+  const res = await esiFetchTracked(url, { ...init, headers: reqHeaders }, timeoutMs);
+  if (!res) {
+    if (cached) {
+      return {
+        ok: true,
+        status: 200,
+        data: cached.data as T,
+        fromCache: true,
+        from304: false,
+        expiresAtMs: cached.expiresAtMs,
+        etag: cached.etag,
+      };
+    }
+    return {
+      ok: false,
+      status: 0,
+      data: null,
+      fromCache: false,
+      from304: false,
+      expiresAtMs: now + 30_000,
+    };
+  }
+
+  const nextExpiry = parseCacheExpiryMs(res, fallbackTtlMs);
+  const newEtag = res.headers.get('etag') || cached?.etag;
+
+  if (res.status === 304 && cached) {
+    esiTelemetryState.from304Count += 1;
+    esiTelemetryState.lastRefreshedAt = new Date().toISOString();
+    esiTelemetryState.nextExpiresAtMs = nextExpiry;
+    esiHttpCache.set(cacheKey, {
+      ...cached,
+      etag: newEtag,
+      expiresAtMs: nextExpiry,
+      fetchedAtMs: now,
+    });
+    return {
+      ok: true,
+      status: 304,
+      data: cached.data as T,
+      fromCache: true,
+      from304: true,
+      expiresAtMs: nextExpiry,
+      etag: newEtag,
+    };
+  }
+
+  if (res.ok) {
+    try {
+      const parsed = (await res.json()) as T;
+      esiTelemetryState.lastRefreshedAt = new Date().toISOString();
+      esiTelemetryState.nextExpiresAtMs = nextExpiry;
+      esiHttpCache.set(cacheKey, {
+        data: parsed,
+        etag: newEtag,
+        expiresAtMs: nextExpiry,
+        fetchedAtMs: now,
+      });
+      // Bound cache size cleanly
+      if (esiHttpCache.size > 1200) {
+        const oldestKey = esiHttpCache.keys().next().value;
+        if (oldestKey) esiHttpCache.delete(oldestKey);
+      }
+      return {
+        ok: true,
+        status: res.status,
+        data: parsed,
+        fromCache: false,
+        from304: false,
+        expiresAtMs: nextExpiry,
+        etag: newEtag,
+      };
+    } catch {
+      return {
+        ok: false,
+        status: res.status,
+        data: cached ? (cached.data as T) : null,
+        fromCache: Boolean(cached),
+        from304: false,
+        expiresAtMs: nextExpiry,
+      };
+    }
+  }
+
+  return {
+    ok: false,
+    status: res.status,
+    data: cached ? (cached.data as T) : null,
+    fromCache: Boolean(cached),
+    from304: false,
+    expiresAtMs: nextExpiry,
+  };
 }
 
 // --- Batch ESI Name Resolution (with 404 bisection) ---
@@ -553,51 +751,63 @@ interface RawEsiOrder {
   is_buy_order: boolean;
   price: number;
   volume_remain: number;
+  min_volume?: number;
 }
 
 const esiBatchQuoteCache = new Map<
   number,
-  { quote: MarketQuote; corridorOrders: CorridorOrder[]; fetchedAt: number }
+  { quote: MarketQuote; corridorOrders: CorridorOrder[]; fetchedAt: number; expiresAtMs: number }
 >();
 
-const avg7dVolCache = new Map<string, { avgDailyVol7d: number; fetchedAt: number }>();
+const avg7dVolCache = new Map<
+  string,
+  { avgDailyVol7d: number; yesterdayAvgPrice?: number; fetchedAt: number }
+>();
 const HISTORY_7D_CACHE_TTL_MS = 6 * 60 * 60 * 1000; // 6 hours
 
-async function fetch7DayAvgVolume(
+export async function fetch7DayHistoryStats(
   regionId: number,
   typeId: number
-): Promise<number | undefined> {
+): Promise<{ avgDailyVol7d?: number; yesterdayAvgPrice?: number }> {
   const key = `${regionId}:${typeId}`;
   const cached = avg7dVolCache.get(key);
   if (cached && Date.now() - cached.fetchedAt < HISTORY_7D_CACHE_TTL_MS) {
-    return cached.avgDailyVol7d;
+    return {
+      avgDailyVol7d: cached.avgDailyVol7d,
+      yesterdayAvgPrice: cached.yesterdayAvgPrice,
+    };
   }
   const rl = getEsiRateLimitState();
   if (rl.paused || (rl.errorLimitRemain !== null && rl.errorLimitRemain < 35)) {
-    return cached?.avgDailyVol7d;
+    return cached
+      ? { avgDailyVol7d: cached.avgDailyVol7d, yesterdayAvgPrice: cached.yesterdayAvgPrice }
+      : {};
   }
 
-  const res = await esiFetchTracked(
+  const res = await esiCachedFetchJson<{ date: string; volume: number; average?: number }[]>(
     `https://esi.evetech.net/latest/markets/${regionId}/history/?datasource=tranquility&type_id=${typeId}`,
     {},
-    5000
+    { timeoutMs: 5500, fallbackTtlMs: HISTORY_7D_CACHE_TTL_MS }
   );
-  if (!res || !res.ok) return cached?.avgDailyVol7d;
-
-  try {
-    const raw = (await res.json()) as { date: string; volume: number }[];
-    if (!Array.isArray(raw) || raw.length === 0) {
-      avg7dVolCache.set(key, { avgDailyVol7d: 0, fetchedAt: Date.now() });
-      return 0;
-    }
-    const last7 = raw.slice(-7);
-    const totalVol = last7.reduce((s, d) => s + (Number(d.volume) || 0), 0);
-    const avgDailyVol7d = Math.round(totalVol / 7);
-    avg7dVolCache.set(key, { avgDailyVol7d, fetchedAt: Date.now() });
-    return avgDailyVol7d;
-  } catch {
-    return cached?.avgDailyVol7d;
+  if (!res.ok || !Array.isArray(res.data)) {
+    return cached
+      ? { avgDailyVol7d: cached.avgDailyVol7d, yesterdayAvgPrice: cached.yesterdayAvgPrice }
+      : {};
   }
+
+  if (res.data.length === 0) {
+    avg7dVolCache.set(key, { avgDailyVol7d: 0, fetchedAt: Date.now() });
+    return { avgDailyVol7d: 0 };
+  }
+  const sorted = [...res.data].sort((a, b) => a.date.localeCompare(b.date));
+  const last7 = sorted.slice(-7);
+  const totalVol = last7.reduce((s, d) => s + (Number(d.volume) || 0), 0);
+  const avgDailyVol7d = Math.round(totalVol / 7);
+  const lastDay = sorted[sorted.length - 1];
+  const yesterdayAvgPrice =
+    lastDay && Number(lastDay.average) > 0 ? Number(lastDay.average) : undefined;
+  avg7dVolCache.set(key, { avgDailyVol7d, yesterdayAvgPrice, fetchedAt: Date.now() });
+  return { avgDailyVol7d, yesterdayAvgPrice };
 }
 
 function aggregateStationOrders(
@@ -609,59 +819,67 @@ function aggregateStationOrders(
   buyMax: number;
   buyVolume: number;
   topBuyDepthUnits: number;
-  buyLevels: { price: number; volume: number }[];
+  buyLevels: OrderBookLevel[];
+  sellLevels: OrderBookLevel[];
 } {
   let sellMin = Infinity;
   let sellVolume = 0;
   let buyMax = 0;
   let buyVolume = 0;
 
-  // Prefer exact trade hub station; fall back to regional orders if station has no orders
   let stationSellMin = Infinity;
   let stationSellVol = 0;
   let stationBuyMax = 0;
   let stationBuyVol = 0;
 
-  const stationBuyBuckets = new Map<number, number>();
-  const regionalBuyBuckets = new Map<number, number>();
+  const stationBuyOrders: OrderBookLevel[] = [];
+  const regionalBuyOrders: OrderBookLevel[] = [];
+  const stationSellOrders: OrderBookLevel[] = [];
+  const regionalSellOrders: OrderBookLevel[] = [];
 
   for (const o of orders) {
     if (!o || o.price <= 0 || o.volume_remain <= 0) continue;
+    const roundedPrice = Math.round(o.price * 100) / 100;
+    const minVol = Math.max(1, Number(o.min_volume ?? 1));
     if (o.is_buy_order) {
       buyVolume += o.volume_remain;
       if (o.price > buyMax) buyMax = o.price;
-      const roundedPrice = Math.round(o.price * 100) / 100;
-      regionalBuyBuckets.set(
-        roundedPrice,
-        (regionalBuyBuckets.get(roundedPrice) ?? 0) + o.volume_remain
-      );
+      regionalBuyOrders.push({ price: roundedPrice, volume: o.volume_remain, minVolume: minVol });
       if (o.location_id === stationId) {
         stationBuyVol += o.volume_remain;
         if (o.price > stationBuyMax) stationBuyMax = o.price;
-        stationBuyBuckets.set(
-          roundedPrice,
-          (stationBuyBuckets.get(roundedPrice) ?? 0) + o.volume_remain
-        );
+        stationBuyOrders.push({ price: roundedPrice, volume: o.volume_remain, minVolume: minVol });
       }
     } else {
       sellVolume += o.volume_remain;
       if (o.price < sellMin) sellMin = o.price;
+      regionalSellOrders.push({ price: roundedPrice, volume: o.volume_remain, minVolume: 1 });
       if (o.location_id === stationId) {
         stationSellVol += o.volume_remain;
         if (o.price < stationSellMin) stationSellMin = o.price;
+        stationSellOrders.push({ price: roundedPrice, volume: o.volume_remain, minVolume: 1 });
       }
     }
   }
 
   const effectiveBuyMax = stationBuyMax > 0 ? stationBuyMax : buyMax;
-  const activeBuyMap =
-    stationBuyBuckets.size > 0 ? stationBuyBuckets : regionalBuyBuckets;
-  const buyLevels = Array.from(activeBuyMap.entries())
-    .sort((a, b) => b[0] - a[0])
-    .slice(0, 15)
-    .map(([price, volume]) => ({ price, volume }));
+  const activeBuySource = stationBuyOrders.length > 0 ? stationBuyOrders : regionalBuyOrders;
+  const activeSellSource = stationSellOrders.length > 0 ? stationSellOrders : regionalSellOrders;
 
-  // Top buy-order depth within 5% of top buy price
+  const buyLevels = activeBuySource
+    .sort((a, b) => b.price - a.price)
+    .slice(0, 20);
+
+  // Merge same-price sell tiers for clean compact storage while keeping ascending order
+  const sellBucketMap = new Map<number, number>();
+  for (const s of activeSellSource) {
+    sellBucketMap.set(s.price, (sellBucketMap.get(s.price) ?? 0) + s.volume);
+  }
+  const sellLevels: OrderBookLevel[] = Array.from(sellBucketMap.entries())
+    .sort((a, b) => a[0] - b[0])
+    .slice(0, 20)
+    .map(([price, volume]) => ({ price, volume, minVolume: 1 }));
+
   const topBuyFloor = effectiveBuyMax * 0.95;
   const topBuyDepthUnits = buyLevels
     .filter((lvl) => lvl.price >= topBuyFloor)
@@ -678,6 +896,7 @@ function aggregateStationOrders(
     buyVolume: stationBuyVol > 0 ? stationBuyVol : buyVolume,
     topBuyDepthUnits,
     buyLevels,
+    sellLevels,
   };
 }
 
@@ -702,7 +921,8 @@ export async function scanMarketOrderBatch(
   const toFetch: number[] = [];
   for (const id of cleanIds) {
     const cached = !force ? esiBatchQuoteCache.get(id) : undefined;
-    if (cached && now - cached.fetchedAt < ORDER_CACHE_TTL_MS) {
+    if (cached && now < cached.expiresAtMs) {
+      esiTelemetryState.zeroTokenHits += 1;
       quotes[id] = cached.quote;
       corridorOrders.push(...cached.corridorOrders);
       if (cached.quote.source === 'live') liveCount += 1;
@@ -719,41 +939,25 @@ export async function scanMarketOrderBatch(
     while (cursor < toFetch.length) {
       if (getEsiRateLimitState().paused) return;
       const typeId = toFetch[cursor++];
+      const priorQuote = esiBatchQuoteCache.get(typeId)?.quote;
 
       const [jitaRes, dodixieRes] = await Promise.all([
-        esiFetchTracked(
+        esiCachedFetchJson<RawEsiOrder[]>(
           `https://esi.evetech.net/latest/markets/${EVE_ANCHORS.THE_FORGE_REGION_ID}/orders/?datasource=tranquility&order_type=all&type_id=${typeId}`,
           {},
-          7000
+          { timeoutMs: 7000, fallbackTtlMs: ORDER_CACHE_TTL_MS, forceRevalidate: force }
         ),
-        esiFetchTracked(
+        esiCachedFetchJson<RawEsiOrder[]>(
           `https://esi.evetech.net/latest/markets/${EVE_ANCHORS.SINQ_LAISON_REGION_ID}/orders/?datasource=tranquility&order_type=all&type_id=${typeId}`,
           {},
-          7000
+          { timeoutMs: 7000, fallbackTtlMs: ORDER_CACHE_TTL_MS, forceRevalidate: force }
         ),
       ]);
 
       if (getEsiRateLimitState().paused) return;
 
-      let jitaOrders: RawEsiOrder[] = [];
-      let dodixieOrders: RawEsiOrder[] = [];
-
-      if (jitaRes && jitaRes.ok) {
-        try {
-          const parsed = (await jitaRes.json()) as RawEsiOrder[];
-          if (Array.isArray(parsed)) jitaOrders = parsed;
-        } catch {
-          // ignore
-        }
-      }
-      if (dodixieRes && dodixieRes.ok) {
-        try {
-          const parsed = (await dodixieRes.json()) as RawEsiOrder[];
-          if (Array.isArray(parsed)) dodixieOrders = parsed;
-        } catch {
-          // ignore
-        }
-      }
+      const jitaOrders = Array.isArray(jitaRes.data) ? jitaRes.data : [];
+      const dodixieOrders = Array.isArray(dodixieRes.data) ? dodixieRes.data : [];
 
       const jAgg = aggregateStationOrders(jitaOrders, EVE_ANCHORS.JITA_STATION_ID);
       const dAgg = aggregateStationOrders(dodixieOrders, EVE_ANCHORS.DODIXIE_STATION_ID);
@@ -762,14 +966,13 @@ export async function scanMarketOrderBatch(
       const hasLive =
         jAgg.sellMin > 0 || jAgg.buyMax > 0 || dAgg.sellMin > 0 || dAgg.buyMax > 0;
 
-      // Cross-check real 7-day average daily trading volume from ESI /markets/{region_id}/history/
-      // when live quotes exist and ESI budget is healthy (cached 6h)
-      let jitaAvg7d: number | undefined;
-      let dodixieAvg7d: number | undefined;
+      // Cross-check real 7-day average daily trading volume + yesterday's daily avg from ESI history
+      let jitaStats: { avgDailyVol7d?: number; yesterdayAvgPrice?: number } = {};
+      let dodixieStats: { avgDailyVol7d?: number; yesterdayAvgPrice?: number } = {};
       if (hasLive && !getEsiRateLimitState().paused) {
-        [jitaAvg7d, dodixieAvg7d] = await Promise.all([
-          fetch7DayAvgVolume(EVE_ANCHORS.THE_FORGE_REGION_ID, typeId),
-          fetch7DayAvgVolume(EVE_ANCHORS.SINQ_LAISON_REGION_ID, typeId),
+        [jitaStats, dodixieStats] = await Promise.all([
+          fetch7DayHistoryStats(EVE_ANCHORS.THE_FORGE_REGION_ID, typeId),
+          fetch7DayHistoryStats(EVE_ANCHORS.SINQ_LAISON_REGION_ID, typeId),
         ]);
       }
 
@@ -793,39 +996,64 @@ export async function scanMarketOrderBatch(
       }
 
       const estDailyJitaVol =
-        jitaAvg7d !== undefined
-          ? jitaAvg7d
+        jitaStats.avgDailyVol7d !== undefined
+          ? jitaStats.avgDailyVol7d
           : base?.estDailyJitaVol ??
             Math.round((jAgg.sellVolume + jAgg.buyVolume) * 0.12);
       const estDailyDodixieVol =
-        dodixieAvg7d !== undefined
-          ? dodixieAvg7d
+        dodixieStats.avgDailyVol7d !== undefined
+          ? dodixieStats.avgDailyVol7d
           : base?.estDailyDodixieVol ??
             Math.round((dAgg.sellVolume + dAgg.buyVolume) * 0.12);
+
+      const newJitaSell = jAgg.sellMin > 0 ? jAgg.sellMin : base?.baseJitaSell ?? 0;
+      const newJitaBuy = jAgg.buyMax > 0 ? jAgg.buyMax : base?.baseJitaBuy ?? 0;
+      const newDodixieSell = dAgg.sellMin > 0 ? dAgg.sellMin : base?.baseDodixieSell ?? 0;
+      const newDodixieBuy = dAgg.buyMax > 0 ? dAgg.buyMax : base?.baseDodixieBuy ?? 0;
 
       const quote: MarketQuote = {
         typeId,
         jita: {
-          sellMin: jAgg.sellMin > 0 ? jAgg.sellMin : base?.baseJitaSell ?? 0,
+          sellMin: newJitaSell,
           sellVolume: jAgg.sellVolume,
-          buyMax: jAgg.buyMax > 0 ? jAgg.buyMax : base?.baseJitaBuy ?? 0,
+          buyMax: newJitaBuy,
           buyVolume: jAgg.buyVolume,
-          sellPercentile: jAgg.sellMin > 0 ? jAgg.sellMin : base?.baseJitaSell ?? 0,
-          buyPercentile: jAgg.buyMax > 0 ? jAgg.buyMax : base?.baseJitaBuy ?? 0,
+          sellPercentile: newJitaSell,
+          buyPercentile: newJitaBuy,
           topBuyDepthUnits: jAgg.topBuyDepthUnits,
           buyLevels: jAgg.buyLevels,
-          avgDailyVol7d: jitaAvg7d,
+          sellLevels: jAgg.sellLevels,
+          avgDailyVol7d: jitaStats.avgDailyVol7d,
+          yesterdayAvgPrice: jitaStats.yesterdayAvgPrice,
+          prevSessionSellMin:
+            priorQuote && priorQuote.jita.sellMin > 0 && priorQuote.jita.sellMin !== newJitaSell
+              ? priorQuote.jita.sellMin
+              : priorQuote?.jita.prevSessionSellMin,
+          prevSessionBuyMax:
+            priorQuote && priorQuote.jita.buyMax > 0 && priorQuote.jita.buyMax !== newJitaBuy
+              ? priorQuote.jita.buyMax
+              : priorQuote?.jita.prevSessionBuyMax,
         },
         dodixie: {
-          sellMin: dAgg.sellMin > 0 ? dAgg.sellMin : base?.baseDodixieSell ?? 0,
+          sellMin: newDodixieSell,
           sellVolume: dAgg.sellVolume,
-          buyMax: dAgg.buyMax > 0 ? dAgg.buyMax : base?.baseDodixieBuy ?? 0,
+          buyMax: newDodixieBuy,
           buyVolume: dAgg.buyVolume,
-          sellPercentile: dAgg.sellMin > 0 ? dAgg.sellMin : base?.baseDodixieSell ?? 0,
-          buyPercentile: dAgg.buyMax > 0 ? dAgg.buyMax : base?.baseDodixieBuy ?? 0,
+          sellPercentile: newDodixieSell,
+          buyPercentile: newDodixieBuy,
           topBuyDepthUnits: dAgg.topBuyDepthUnits,
           buyLevels: dAgg.buyLevels,
-          avgDailyVol7d: dodixieAvg7d,
+          sellLevels: dAgg.sellLevels,
+          avgDailyVol7d: dodixieStats.avgDailyVol7d,
+          yesterdayAvgPrice: dodixieStats.yesterdayAvgPrice,
+          prevSessionSellMin:
+            priorQuote && priorQuote.dodixie.sellMin > 0 && priorQuote.dodixie.sellMin !== newDodixieSell
+              ? priorQuote.dodixie.sellMin
+              : priorQuote?.dodixie.prevSessionSellMin,
+          prevSessionBuyMax:
+            priorQuote && priorQuote.dodixie.buyMax > 0 && priorQuote.dodixie.buyMax !== newDodixieBuy
+              ? priorQuote.dodixie.buyMax
+              : priorQuote?.dodixie.prevSessionBuyMax,
         },
         estDailyJitaVol,
         estDailyDodixieVol,
@@ -855,12 +1083,15 @@ export async function scanMarketOrderBatch(
       if (sortedBuy.length > 0) quote.corridorBestBuy = sortedBuy[0];
       if (sortedSell.length > 0) quote.corridorBestSell = sortedSell[0];
 
+      const expiresAtMs = Math.min(jitaRes.expiresAtMs, dodixieRes.expiresAtMs);
+
       if (hasLive) {
         liveCount += 1;
         esiBatchQuoteCache.set(typeId, {
           quote,
           corridorOrders: itemCorridor,
           fetchedAt: Date.now(),
+          expiresAtMs,
         });
       }
 

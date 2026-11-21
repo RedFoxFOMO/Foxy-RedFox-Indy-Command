@@ -1,12 +1,21 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import {
   AlertTriangle,
+  ArrowDown,
+  ArrowUp,
+  Check,
   CheckCircle2,
+  Copy,
   ExternalLink,
   RefreshCw,
 } from 'lucide-react';
 import { EVE_ANCHORS } from '../data/eveCatalog.ts';
 import { formatIsk } from '../engines/decisionEngines.ts';
+import {
+  computeEve4SigFigTick,
+  computeRelistFeePreview,
+} from '../utils/eveMarketMath.ts';
+import { copyTextToClipboard } from '../utils/eveMultibuy.ts';
 import type {
   ActionCardData,
   LiveOrderBookEntry,
@@ -266,6 +275,7 @@ export function LiveOrderBookPanel({
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [openingMarket, setOpeningMarket] = useState(false);
+  const [copiedTickOrderId, setCopiedTickOrderId] = useState<number | null>(null);
   const [marketFeedback, setMarketFeedback] = useState<{
     kind: 'success' | 'warn' | 'error';
     text: string;
@@ -399,17 +409,87 @@ export function LiveOrderBookPanel({
     sameRegion: data?.sameRegion,
   });
 
+  const topSellPrice = data?.topSellOrdersAtBuyHub?.[0]?.price ?? 0;
+  const yesterdayAvg = data?.yesterdayAvgPrice ?? 0;
+  const prevSessionSell = data?.prevSessionSellMin ?? 0;
+
+  // Dual Trend Arrows (Market Depth view ONLY):
+  // 1) Large bold saturated arrow (#10B981 / #EF4444) for 24h trend vs yesterday's ESI daily average
+  // 2) Smaller soft pastel arrow (#86EFAC / #FCA5A5) for recent session tick since last 5-min refresh
+  const delta24hPct =
+    topSellPrice > 0 && yesterdayAvg > 0
+      ? ((topSellPrice - yesterdayAvg) / yesterdayAvg) * 100
+      : null;
+  const deltaSessionPct =
+    topSellPrice > 0 && prevSessionSell > 0
+      ? ((topSellPrice - prevSessionSell) / prevSessionSell) * 100
+      : null;
+
+  const handleCopyTickPrice = async (
+    orderId: number,
+    competitorPrice: number,
+    direction: 'undercut_sell' | 'outbid_buy'
+  ) => {
+    const tickPrice = computeEve4SigFigTick(competitorPrice, direction);
+    const ok = await copyTextToClipboard(String(tickPrice));
+    if (!ok) return;
+    setCopiedTickOrderId(orderId);
+    window.setTimeout(() => setCopiedTickOrderId((prev) => (prev === orderId ? null : prev)), 1800);
+  };
+
   return (
     <div className="border-t border-slate-800/90 bg-[#0b0f17] px-5 py-4 space-y-3.5">
-      {/* Header + Item Switcher (for multi-item cards) + Refresh */}
+      {/* Header + Dual Trend Arrows (Market Depth ONLY) + Refresh */}
       <div className="flex flex-wrap items-center justify-between gap-2">
-        <div className="flex flex-wrap items-center gap-2 min-w-0">
+        <div className="flex flex-wrap items-center gap-2.5 min-w-0">
           <span className="text-xs font-semibold text-slate-100">
-            Live ESI Order Book &amp; Remote Buy Range
+            Live ESI Market Depth &amp; Remote Buy Range
           </span>
-          <span className="text-[11px] font-mono text-slate-500">
+          <span className="text-[11px] font-mono text-slate-400">
             · {activeTarget.name} (ID {activeTarget.typeId})
           </span>
+          {topSellPrice > 0 && (
+            <span className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded-md bg-slate-900 border border-slate-800 font-mono text-xs text-slate-100">
+              <span>{formatIsk(topSellPrice, false)}</span>
+              {/* Dual Trend Arrows: Large Saturated 24h Arrow + Small Pastel Session Tick Arrow */}
+              <span
+                className="inline-flex items-center gap-0.5"
+                title={`24h vs yesterday avg (${yesterdayAvg > 0 ? formatIsk(yesterdayAvg, false) : 'n/a'}): ${
+                  delta24hPct !== null ? `${delta24hPct >= 0 ? '+' : ''}${delta24hPct.toFixed(2)}%` : 'flat'
+                } | Recent 5m tick: ${
+                  deltaSessionPct !== null ? `${deltaSessionPct >= 0 ? '+' : ''}${deltaSessionPct.toFixed(2)}%` : 'unchanged'
+                }`}
+              >
+                {delta24hPct !== null ? (
+                  delta24hPct >= 0 ? (
+                    <ArrowUp className="w-4 h-4 stroke-[3]" style={{ color: '#10B981' }} aria-label="24h trend up" />
+                  ) : (
+                    <ArrowDown className="w-4 h-4 stroke-[3]" style={{ color: '#EF4444' }} aria-label="24h trend down" />
+                  )
+                ) : (
+                  <ArrowUp className="w-4 h-4 stroke-[2.5] opacity-40" style={{ color: '#10B981' }} aria-hidden="true" />
+                )}
+                {deltaSessionPct !== null ? (
+                  deltaSessionPct >= 0 ? (
+                    <ArrowUp className="w-3 h-3 stroke-[2.2]" style={{ color: '#86EFAC' }} aria-label="Session tick up" />
+                  ) : (
+                    <ArrowDown className="w-3 h-3 stroke-[2.2]" style={{ color: '#FCA5A5' }} aria-label="Session tick down" />
+                  )
+                ) : (
+                  <ArrowUp className="w-3 h-3 stroke-[2] opacity-45" style={{ color: '#86EFAC' }} aria-hidden="true" />
+                )}
+              </span>
+              {delta24hPct !== null && (
+                <span
+                  className="text-[10px] font-semibold"
+                  style={{ color: delta24hPct >= 0 ? '#10B981' : '#EF4444' }}
+                >
+                  {delta24hPct >= 0 ? '+' : ''}
+                  {delta24hPct.toFixed(1)}% 24h
+                </span>
+              )}
+            </span>
+          )}
           <span className="text-[10px] font-mono text-slate-500">
             · Marketing Lvl {ROMAN[Math.max(0, Math.min(5, Math.floor(marketingLevel)))]}
           </span>
@@ -552,7 +632,7 @@ export function LiveOrderBookPanel({
                   <th className="py-1.5 px-2.5 text-right font-medium">Price (ISK)</th>
                   <th className="py-1.5 px-2.5 text-right font-medium">Vol Remain</th>
                   <th className="py-1.5 px-2.5 text-left font-medium">Station</th>
-                  <th className="py-1.5 px-2.5 text-right font-medium">Min Vol</th>
+                  <th className="py-1.5 px-2 text-right font-medium">4-Sig Tick</th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-slate-800/60">
@@ -569,42 +649,70 @@ export function LiveOrderBookPanel({
                     </td>
                   </tr>
                 ) : (
-                  sellHubDepth.rows.map((order) => (
-                    <tr
-                      key={order.orderId}
-                      className={
-                        order.isHighlighted
-                          ? 'bg-emerald-500/12 text-slate-100'
-                          : 'text-slate-400 hover:bg-slate-800/30'
-                      }
-                    >
-                      <td className="py-1.5 px-2.5 text-right font-mono tabular-nums font-medium whitespace-nowrap">
-                        <span className={order.isHighlighted ? 'text-emerald-300' : 'text-slate-300'}>
-                          {order.price.toLocaleString('en-US', {
-                            minimumFractionDigits: 2,
-                            maximumFractionDigits: 2,
-                          })}
-                        </span>
-                      </td>
-                      <td className="py-1.5 px-2.5 text-right font-mono tabular-nums whitespace-nowrap">
-                        <span>{order.volumeRemain.toLocaleString('en-US')}</span>
-                        {order.isHighlighted && (
-                          <span className="ml-1 text-[9px] text-emerald-300">
-                            ({order.fillsQty.toLocaleString('en-US')})
-                          </span>
-                        )}
-                      </td>
-                      <td
-                        className="py-1.5 px-2.5 text-left truncate max-w-[180px]"
-                        title={order.stationName}
+                  sellHubDepth.rows.map((order) => {
+                    const nextTick = computeEve4SigFigTick(order.price, 'undercut_sell');
+                    const relist = computeRelistFeePreview({
+                      oldPrice: order.price,
+                      newPrice: nextTick,
+                      volumeRemain: Math.min(order.volumeRemain, targetBuyQty),
+                      isBuyOrder: false,
+                      brokerRelationsLvl: profile.skills.brokerRelations,
+                      advBrokerRelationsLvl: profile.skills.advancedBrokerRelations ?? 0,
+                      accountingLvl: profile.skills.accounting,
+                    });
+                    return (
+                      <tr
+                        key={order.orderId}
+                        className={
+                          order.isHighlighted
+                            ? 'bg-emerald-500/12 text-slate-100'
+                            : 'text-slate-400 hover:bg-slate-800/30'
+                        }
                       >
-                        {order.stationName}
-                      </td>
-                      <td className="py-1.5 px-2.5 text-right font-mono tabular-nums whitespace-nowrap">
-                        {order.minVolume.toLocaleString('en-US')}
-                      </td>
-                    </tr>
-                  ))
+                        <td className="py-1.5 px-2.5 text-right font-mono tabular-nums font-medium whitespace-nowrap">
+                          <span className={order.isHighlighted ? 'text-emerald-300' : 'text-slate-300'}>
+                            {order.price.toLocaleString('en-US', {
+                              minimumFractionDigits: 2,
+                              maximumFractionDigits: 2,
+                            })}
+                          </span>
+                        </td>
+                        <td className="py-1.5 px-2.5 text-right font-mono tabular-nums whitespace-nowrap">
+                          <span>{order.volumeRemain.toLocaleString('en-US')}</span>
+                          {order.isHighlighted && (
+                            <span className="ml-1 text-[9px] text-emerald-300">
+                              ({order.fillsQty.toLocaleString('en-US')})
+                            </span>
+                          )}
+                        </td>
+                        <td
+                          className="py-1.5 px-2.5 text-left truncate max-w-[160px]"
+                          title={order.stationName}
+                        >
+                          {order.stationName}
+                        </td>
+                        <td className="py-1.5 px-2 text-right whitespace-nowrap">
+                          <button
+                            type="button"
+                            onClick={() => handleCopyTickPrice(order.orderId, order.price, 'undercut_sell')}
+                            title={`Copy exact 4-sig-fig undercut tick ${nextTick.toLocaleString('en-US')} ISK · Relist fee est: ${formatIsk(relist.modificationFeeIsk)}`}
+                            className={`inline-flex items-center gap-1 px-1.5 py-0.5 rounded border text-[10px] font-mono cursor-pointer transition-colors ${
+                              copiedTickOrderId === order.orderId
+                                ? 'border-emerald-400/60 bg-emerald-500/20 text-emerald-200'
+                                : 'border-slate-700 bg-slate-900 text-amber-300 hover:border-amber-400/50'
+                            }`}
+                          >
+                            {copiedTickOrderId === order.orderId ? (
+                              <Check className="w-2.5 h-2.5" />
+                            ) : (
+                              <Copy className="w-2.5 h-2.5" />
+                            )}
+                            <span>{copiedTickOrderId === order.orderId ? 'Copied' : nextTick.toLocaleString('en-US')}</span>
+                          </button>
+                        </td>
+                      </tr>
+                    );
+                  })
                 )}
               </tbody>
             </table>
@@ -643,7 +751,7 @@ export function LiveOrderBookPanel({
                   <th className="py-1.5 px-2.5 text-right font-medium">Price (ISK)</th>
                   <th className="py-1.5 px-2.5 text-right font-medium">Vol Remain</th>
                   <th className="py-1.5 px-2.5 text-left font-medium">Station</th>
-                  <th className="py-1.5 px-2.5 text-right font-medium">Min Vol</th>
+                  <th className="py-1.5 px-2 text-right font-medium">Outbid Tick</th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-slate-800/60">
@@ -660,42 +768,66 @@ export function LiveOrderBookPanel({
                     </td>
                   </tr>
                 ) : (
-                  buyHubDepth.rows.map((order) => (
-                    <tr
-                      key={order.orderId}
-                      className={
-                        order.isHighlighted
-                          ? 'bg-sky-500/12 text-slate-100'
-                          : 'text-slate-400 hover:bg-slate-800/30'
-                      }
-                    >
-                      <td className="py-1.5 px-2.5 text-right font-mono tabular-nums font-medium whitespace-nowrap">
-                        <span className={order.isHighlighted ? 'text-amber-300' : 'text-slate-300'}>
-                          {order.price.toLocaleString('en-US', {
-                            minimumFractionDigits: 2,
-                            maximumFractionDigits: 2,
-                          })}
-                        </span>
-                      </td>
-                      <td className="py-1.5 px-2.5 text-right font-mono tabular-nums whitespace-nowrap">
-                        <span>{order.volumeRemain.toLocaleString('en-US')}</span>
-                        {order.isHighlighted && (
-                          <span className="ml-1 text-[9px] text-sky-300">
-                            ({order.fillsQty.toLocaleString('en-US')})
-                          </span>
-                        )}
-                      </td>
-                      <td
-                        className="py-1.5 px-2.5 text-left truncate max-w-[180px]"
-                        title={order.stationName}
+                  buyHubDepth.rows.map((order) => {
+                    const nextTick = computeEve4SigFigTick(order.price, 'outbid_buy');
+                    return (
+                      <tr
+                        key={order.orderId}
+                        className={
+                          order.isHighlighted
+                            ? 'bg-sky-500/12 text-slate-100'
+                            : 'text-slate-400 hover:bg-slate-800/30'
+                        }
                       >
-                        {order.stationName}
-                      </td>
-                      <td className="py-1.5 px-2.5 text-right font-mono tabular-nums whitespace-nowrap">
-                        {order.minVolume.toLocaleString('en-US')}
-                      </td>
-                    </tr>
-                  ))
+                        <td className="py-1.5 px-2.5 text-right font-mono tabular-nums font-medium whitespace-nowrap">
+                          <span className={order.isHighlighted ? 'text-amber-300' : 'text-slate-300'}>
+                            {order.price.toLocaleString('en-US', {
+                              minimumFractionDigits: 2,
+                              maximumFractionDigits: 2,
+                            })}
+                          </span>
+                        </td>
+                        <td className="py-1.5 px-2.5 text-right font-mono tabular-nums whitespace-nowrap">
+                          <span>{order.volumeRemain.toLocaleString('en-US')}</span>
+                          {order.isHighlighted && (
+                            <span className="ml-1 text-[9px] text-sky-300">
+                              ({order.fillsQty.toLocaleString('en-US')})
+                            </span>
+                          )}
+                        </td>
+                        <td
+                          className="py-1.5 px-2.5 text-left truncate max-w-[160px]"
+                          title={`${order.stationName} · Min Vol: ${order.minVolume}`}
+                        >
+                          {order.stationName}
+                          {order.minVolume > 1 && (
+                            <span className="ml-1 text-[9px] font-mono text-amber-400">
+                              (min {order.minVolume})
+                            </span>
+                          )}
+                        </td>
+                        <td className="py-1.5 px-2 text-right whitespace-nowrap">
+                          <button
+                            type="button"
+                            onClick={() => handleCopyTickPrice(order.orderId, order.price, 'outbid_buy')}
+                            title={`Copy exact 4-sig-fig outbid tick ${nextTick.toLocaleString('en-US')} ISK`}
+                            className={`inline-flex items-center gap-1 px-1.5 py-0.5 rounded border text-[10px] font-mono cursor-pointer transition-colors ${
+                              copiedTickOrderId === order.orderId
+                                ? 'border-emerald-400/60 bg-emerald-500/20 text-emerald-200'
+                                : 'border-slate-700 bg-slate-900 text-cyan-300 hover:border-cyan-400/50'
+                            }`}
+                          >
+                            {copiedTickOrderId === order.orderId ? (
+                              <Check className="w-2.5 h-2.5" />
+                            ) : (
+                              <Copy className="w-2.5 h-2.5" />
+                            )}
+                            <span>{copiedTickOrderId === order.orderId ? 'Copied' : nextTick.toLocaleString('en-US')}</span>
+                          </button>
+                        </td>
+                      </tr>
+                    );
+                  })
                 )}
               </tbody>
             </table>

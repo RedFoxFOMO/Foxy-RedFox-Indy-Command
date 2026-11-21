@@ -62,6 +62,7 @@ export function BlueprintLibraryPanel({
   const [searchQuery, setSearchQuery] = useState('');
   const [filterMode, setFilterMode] = useState<BlueprintFilterMode>('all');
   const [showAllRows, setShowAllRows] = useState(false);
+  const [selectedBpKey, setSelectedBpKey] = useState<string | null>(null);
 
   // Index live Indy & T2 Action Cards by productTypeId and normalized product name
   const profitabilityIndex = useMemo(() => {
@@ -399,10 +400,17 @@ export function BlueprintLibraryPanel({
             <tbody className="divide-y divide-slate-800/60">
               {visibleRows.map((row) => {
                 const { bp, isBpo, displayName, matchedCard, historyTypeId, historyName } = row;
+                const rowKey = `${bp.source ?? 'personal'}-${bp.itemId}`;
+                const isSelected = selectedBpKey === rowKey;
                 return (
                   <tr
-                    key={`${bp.source ?? 'personal'}-${bp.itemId}`}
-                    className="hover:bg-slate-800/35 transition-colors"
+                    key={rowKey}
+                    onClick={() => setSelectedBpKey(rowKey)}
+                    className={
+                      isSelected
+                        ? 'bg-cyan-500/[0.09] shadow-[inset_3px_0_0_#22d3ee,inset_0_1px_0_rgba(34,211,238,0.12)] transition-colors cursor-pointer'
+                        : 'hover:bg-slate-800/35 transition-colors cursor-pointer'
+                    }
                   >
                     <td className="py-2 px-3">
                       <div className="flex items-center gap-1.5 min-w-0">

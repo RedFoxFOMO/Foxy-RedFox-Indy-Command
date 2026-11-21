@@ -10,11 +10,18 @@ import {
   REPROCESSING_CATALOG,
   getItemsForCategories,
 } from '../data/eveCatalog.ts';
+import {
+  findOptimalProfitableQty,
+  walkBuyOrderbookForSell,
+  walkSellOrderbookForBuy,
+} from '../utils/eveMarketMath.ts';
 import type {
   ActionCardData,
   ActiveMarketOrder,
   ActiveOrderConflict,
+  BomMaterialSpec,
   CorridorOrder,
+  DepthWalkResult,
   DynamicMarketCatalog,
   EngineBundle,
   EveItem,
@@ -216,6 +223,7 @@ export function getUpwellStructureBonuses(config: IndustryStructureConfig): {
   rigTeBonus: number;
   rigCostBonus: number;
   effectiveMeMult: number;
+  effectiveTeMult: number;
   effectiveCostMult: number;
 } {
   const isNpc = config.structureType === 'npc_station';
@@ -226,7 +234,11 @@ export function getUpwellStructureBonuses(config: IndustryStructureConfig): {
         ? { label: 'Azbel', me: 0.01, te: 0.2, cost: 0.04 }
         : config.structureType === 'raitaru'
           ? { label: 'Raitaru', me: 0.01, te: 0.15, cost: 0.03 }
-          : { label: 'NPC Station', me: 0, te: 0, cost: 0 };
+          : config.structureType === 'tatara'
+            ? { label: 'Tatara', me: 0, te: 0.25, cost: 0.04 }
+            : config.structureType === 'athanor'
+              ? { label: 'Athanor', me: 0, te: 0.15, cost: 0.02 }
+              : { label: 'NPC Station', me: 0, te: 0, cost: 0 };
 
   // High-Sec Upwell Engineering Rig bonuses (1.0x security multiplier)
   const rigMeBonus = isNpc ? 0 : config.meRig === 't2' ? 0.024 : config.meRig === 't1' ? 0.02 : 0;
@@ -242,6 +254,7 @@ export function getUpwellStructureBonuses(config: IndustryStructureConfig): {
     rigTeBonus,
     rigCostBonus,
     effectiveMeMult: (1 - structSpec.me) * (1 - rigMeBonus),
+    effectiveTeMult: (1 - structSpec.te) * (1 - rigTeBonus),
     effectiveCostMult: (1 - structSpec.cost) * (1 - rigCostBonus),
   };
 }
@@ -521,7 +534,34 @@ function computeIndyAndInvention(
     const activeDepth = sellInDodixie ? dodixieDepth : jitaDepth;
     const activeExitUnitPrice = sellInDodixie ? dodixieUnitExitPrice : jitaUnitExitPrice;
 
-    // Cap batch runs by capital budget AND realistic absorbable destination market depth (max 25% 7d avg / buy-book depth)
+    const effectiveTe =
+      recipe.tier === 'T2'
+        ? ownedBp?.te ?? recipe.invention?.t2Te ?? 4
+        : ownedBp?.te ?? 20;
+
+    // Realistic EVE single-run base manufacturing duration (seconds) before skills/TE/structure bonuses
+    const baseRunDurationSec =
+      recipe.tier === 'T2'
+        ? recipe.category === 't2_ammo'
+          ? 3000
+          : recipe.category === 't2_drones'
+            ? 7200
+            : 10800
+        : recipe.category === 't1_ammo'
+          ? 1800
+          : recipe.category === 'shuttles'
+            ? 3600
+            : recipe.category === 'fuel_blocks'
+              ? 1800
+              : 4500;
+
+    // Build hangar stock lookup for Dual Profit Modes (Buy All vs Buy Missing)
+    const hangarQtyByType = new Map<number, number>();
+    for (const h of Object.values(profile.hangarStock ?? {})) {
+      hangarQtyByType.set(h.typeId, (hangarQtyByType.get(h.typeId) ?? 0) + h.total);
+    }
+
+    // Cap batch runs by capital budget AND realistic absorbable destination market depth
     const maxBudgetRuns = Math.max(
       1,
       Math.floor((budgetCap * 0.45) / Math.max(1, singleRunTotalCost))
@@ -530,46 +570,88 @@ function computeIndyAndInvention(
       1,
       Math.floor(Math.max(recipe.outputPerRun, activeDepth.maxUnits) / recipe.outputPerRun)
     );
-    const runs = Math.max(1, Math.min(recipe.batchRuns, maxBudgetRuns, maxDepthRuns));
+    const optimalRuns = Math.max(1, Math.min(recipe.batchRuns, maxBudgetRuns, maxDepthRuns));
+    const runs = optimalRuns;
 
     const totalOutputUnits = runs * recipe.outputPerRun;
-    const totalMatCost = singleRunMatCost * runs;
     const totalJobFee = singleRunJobFee * runs;
     const totalInventionCost = inventionCostPerRun * runs;
-    const requiredCapital = totalMatCost + totalJobFee + totalInventionCost;
 
-    const grossRevenue = totalOutputUnits * activeExitUnitPrice;
-    const netRevenue = grossRevenue * (1 - totalSellFee);
-    const netProfit = netRevenue - requiredCapital;
-    const roiPct = requiredCapital > 0 ? (netProfit / requiredCapital) * 100 : 0;
-    const netMarginPct = grossRevenue > 0 ? (netProfit / grossRevenue) * 100 : 0;
-
-    const inputVolume = singleRunMatVol * runs;
-    const outputVolume = totalOutputUnits * productItem.volume;
-    const haulVolume = Math.max(inputVolume, outputVolume);
-    const hull = pickHull(haulVolume, requiredCapital, profile);
-
-    // Build inspection BOM rows & accumulate consolidated shopping list for profitable builds
+    // True Orderbook Depth-Walking across all BOM materials (Buy All vs Buy Missing)
     const bomRows: { _typeId?: number; _itemName?: string; [k: string]: string | number | undefined }[] = [];
+    const bomMaterials: BomMaterialSpec[] = [];
     const routeBuyItems: RouteItemSpec[] = [];
+
+    let depthWalkedBuyAllMatCost = 0;
+    let depthWalkedBuyMissingMatCost = 0;
+    let topBookMatCost = 0;
+    let totalMatShortfall = 0;
+    let totalMatInputVol = 0;
+
     for (const mat of recipe.baseMaterials) {
+      const qtyPerRun = Math.max(1, Math.ceil(mat.quantity * meMultiplier));
       const qty = Math.max(1, Math.ceil(mat.quantity * meMultiplier * runs));
       const q = getQuote(snapshot, mat.typeId);
       const item = ITEM_BY_ID[mat.typeId];
-      const matCost = qty * q.jita.sellMin;
-      const matVol = qty * (item?.volume ?? 0.1);
+      const unitVol = item?.volume ?? 0.1;
+
+      const buyAllWalk = walkSellOrderbookForBuy(q.jita, qty);
+      const ownedQty = Math.min(qty, hangarQtyByType.get(mat.typeId) ?? 0);
+      const missingQty = Math.max(0, qty - ownedQty);
+      const buyMissingWalk =
+        missingQty > 0
+          ? walkSellOrderbookForBuy(q.jita, missingQty)
+          : {
+              requestedQty: 0,
+              filledQty: 0,
+              shortfallQty: 0,
+              topOfBookPrice: q.jita.sellMin,
+              weightedAvgPrice: q.jita.sellMin,
+              totalIsk: 0,
+              slippagePct: 0,
+              tiersUsed: 0,
+              isThinDepth: false,
+              sourceKind: 'live_book' as const,
+            };
+
+      const matCost = buyAllWalk.totalIsk > 0 ? buyAllWalk.totalIsk : qty * q.jita.sellMin;
+      const matMissingCost =
+        missingQty > 0
+          ? buyMissingWalk.totalIsk > 0
+            ? buyMissingWalk.totalIsk
+            : missingQty * q.jita.sellMin
+          : 0;
+      const matVol = qty * unitVol;
+
+      depthWalkedBuyAllMatCost += matCost;
+      depthWalkedBuyMissingMatCost += matMissingCost;
+      topBookMatCost += qty * q.jita.sellMin;
+      totalMatShortfall += buyAllWalk.shortfallQty;
+      totalMatInputVol += matVol;
+
+      bomMaterials.push({
+        typeId: mat.typeId,
+        name: item?.name ?? `Type ${mat.typeId}`,
+        qtyPerRun,
+        unitVolumeM3: unitVol,
+        unitPriceTopOfBook: q.jita.sellMin,
+        depthWalk: buyAllWalk,
+      });
+
       const nearby = q.oneJumpCheapestSell;
       const nearbyNote =
         nearby && nearby.price < q.jita.sellMin * 0.992
           ? `${nearby.systemName} (${formatIsk(nearby.price, false)})`
-          : 'Jita 4-4 Best';
+          : buyAllWalk.slippagePct > 0.5
+            ? `Depth +${buyAllWalk.slippagePct.toFixed(1)}%`
+            : 'Jita 4-4 Best';
 
       bomRows.push({
         _typeId: mat.typeId,
         _itemName: item?.name ?? `Type ${mat.typeId}`,
         material: item?.name ?? `Type ${mat.typeId}`,
-        qty: qty.toLocaleString('en-US'),
-        unitPrice: formatIsk(q.jita.sellMin, false),
+        qty: ownedQty > 0 ? `${qty.toLocaleString('en-US')} (${ownedQty.toLocaleString('en-US')} owned)` : qty.toLocaleString('en-US'),
+        unitPrice: formatIsk(buyAllWalk.weightedAvgPrice || q.jita.sellMin, false),
         totalCost: formatIsk(matCost),
         volume: formatM3(matVol),
         sourcing: nearbyNote,
@@ -582,9 +664,36 @@ function computeIndyAndInvention(
         iskAmount: matCost,
         volumeM3: matVol,
       });
+    }
 
-      if (netProfit > 0) {
+    const totalMatCost = depthWalkedBuyAllMatCost;
+    const requiredCapital = totalMatCost + totalJobFee + totalInventionCost;
+    const buyMissingCapitalIsk = depthWalkedBuyMissingMatCost + totalJobFee + totalInventionCost;
+    const hangarSavingsIsk = Math.max(0, totalMatCost - depthWalkedBuyMissingMatCost);
+
+    // Depth-walk destination exit revenue if Instant Fill, otherwise top-of-book list price
+    const destHubQuote = sellInDodixie ? productQuote.dodixie : productQuote.jita;
+    const depthWalkSell =
+      executionMode === 'instant_fill'
+        ? walkBuyOrderbookForSell(destHubQuote, totalOutputUnits)
+        : undefined;
+
+    const grossRevenue =
+      executionMode === 'instant_fill' && depthWalkSell && depthWalkSell.totalIsk > 0
+        ? depthWalkSell.totalIsk
+        : totalOutputUnits * activeExitUnitPrice;
+    const netRevenue = grossRevenue * (1 - totalSellFee);
+    const netProfit = netRevenue - requiredCapital;
+    const buyMissingProfitIsk = netRevenue - buyMissingCapitalIsk;
+    const roiPct = requiredCapital > 0 ? (netProfit / requiredCapital) * 100 : 0;
+    const netMarginPct = grossRevenue > 0 ? (netProfit / grossRevenue) * 100 : 0;
+
+    // Accumulate consolidated shopping list for profitable builds
+    if (netProfit > 0) {
+      for (const mat of bomMaterials) {
+        const qty = mat.qtyPerRun * runs;
         shoppingTotals[mat.typeId] = (shoppingTotals[mat.typeId] ?? 0) + qty;
+        const item = ITEM_BY_ID[mat.typeId];
         if (item?.category === 'minerals') {
           mineralDemand[mat.typeId] = (mineralDemand[mat.typeId] ?? 0) + qty;
         }
@@ -599,11 +708,12 @@ function computeIndyAndInvention(
         const dcQty = expectedAttempts * dc.quantity;
         const dcItem = ITEM_BY_ID[dc.typeId];
         const dcQuote = getQuote(snapshot, dc.typeId);
+        const dcWalk = walkSellOrderbookForBuy(dcQuote.jita, dcQty);
         routeBuyItems.push({
           typeId: dc.typeId,
           name: dcItem?.name ?? `Datacore #${dc.typeId}`,
           quantity: dcQty,
-          iskAmount: dcQty * dcQuote.jita.sellMin,
+          iskAmount: dcWalk.totalIsk || dcQty * dcQuote.jita.sellMin,
           volumeM3: dcQty * (dcItem?.volume ?? 0.1),
         });
         if (netProfit > 0) {
@@ -611,6 +721,26 @@ function computeIndyAndInvention(
         }
       }
     }
+
+    const inputVolume = totalMatInputVol;
+    const outputVolume = totalOutputUnits * productItem.volume;
+    const haulVolume = Math.max(inputVolume, outputVolume);
+    const hull = pickHull(haulVolume, requiredCapital, profile);
+
+    const buySlippagePct =
+      topBookMatCost > 0 ? ((depthWalkedBuyAllMatCost - topBookMatCost) / topBookMatCost) * 100 : 0;
+    const depthWalkBuy: DepthWalkResult = {
+      requestedQty: runs,
+      filledQty: totalMatShortfall > 0 ? Math.max(0, runs - 1) : runs,
+      shortfallQty: totalMatShortfall,
+      weightedAvgPrice: runs > 0 ? totalMatCost / runs : singleRunMatCost,
+      topOfBookPrice: runs > 0 ? topBookMatCost / runs : singleRunMatCost,
+      totalIsk: totalMatCost,
+      slippagePct: buySlippagePct,
+      tiersUsed: 1,
+      isThinDepth: buySlippagePct > 3.5 || totalMatShortfall > 0,
+      sourceKind: 'live_book',
+    };
 
     const steps: string[] = [];
     if (recipe.tier === 'T2' && recipe.invention) {
@@ -621,11 +751,13 @@ function computeIndyAndInvention(
       );
     } else {
       steps.push(
-        `Load ${recipe.productName} BPO (ME ${effectiveMe}) at ${facilityLabel} (Total ME reduction ${((1 - meMultiplier) * 100).toFixed(2)}%).`
+        `Load ${recipe.productName} BPO (ME ${effectiveMe}/TE ${effectiveTe}) at ${facilityLabel} (Total ME reduction ${((1 - meMultiplier) * 100).toFixed(2)}%).`
       );
     }
     steps.push(
-      `Buy consolidated inputs in Jita 4-4 (${formatIsk(totalMatCost)}, ${formatM3(inputVolume)}) and haul to ${structureConfig.systemName} in ${hull.label.split(' (')[0]}.`
+      `Buy consolidated inputs in Jita 4-4 (${formatIsk(totalMatCost)} Buy All${
+        hangarSavingsIsk > 100_000 ? ` / ${formatIsk(buyMissingCapitalIsk)} Buy Missing` : ''
+      }, ${formatM3(inputVolume)}) and haul to ${structureConfig.systemName} in ${hull.label.split(' (')[0]}.`
     );
     steps.push(
       `Queue ${runs} run${runs > 1 ? 's' : ''} (${totalOutputUnits.toLocaleString('en-US')} units) at ${facilityLabel}; install fee ~${formatIsk(totalJobFee)} (Mfg Index ${(liveMfgIndex * 100).toFixed(2)}% + Tax ${structureConfig.facilityTaxPct.toFixed(2)}% + 4% SCC).`
@@ -633,7 +765,12 @@ function computeIndyAndInvention(
     steps.push(
       `Haul finished output (${formatM3(outputVolume)}) to ${targetHub} and ${
         executionMode === 'instant_fill' ? 'instant-sell into buy orders' : 'list sell orders'
-      } at ${formatIsk(activeExitUnitPrice, false)}/unit (Sales Tax ${salesTaxPct.toFixed(2)}%${
+      } at ${formatIsk(
+        executionMode === 'instant_fill' && depthWalkSell && depthWalkSell.weightedAvgPrice > 0
+          ? depthWalkSell.weightedAvgPrice
+          : activeExitUnitPrice,
+        false
+      )}/unit (Sales Tax ${salesTaxPct.toFixed(2)}%${
         brokerFeePct > 0 ? ` + Broker ${brokerFeePct.toFixed(2)}%` : ' · 0% Broker'
       }).`
     );
@@ -665,19 +802,47 @@ function computeIndyAndInvention(
       salesTaxPct,
       brokerFeePct,
       destinationRegionId: destRegionId,
-      riskLabel: roiPct >= 14 ? 'High Margin' : roiPct >= 6 ? 'Nominal' : 'Watch Depth',
+      riskLabel:
+        depthWalkBuy.isThinDepth || depthWalkSell?.isThinDepth
+          ? 'Watch Depth'
+          : roiPct >= 14
+            ? 'High Margin'
+            : roiPct >= 6
+              ? 'Nominal'
+              : 'Watch Depth',
+      // v2.1.0 Depth-Walking, Dual Profit & Interactive Slicer metadata
+      isEditableQty: true,
+      qtyUnitLabel: 'runs',
+      baseBatchQty: runs,
+      optimalProfitableQty: optimalRuns,
+      outputPerRun: recipe.outputPerRun,
+      baseRunDurationSec,
+      bpMe: effectiveMe,
+      bpTe: effectiveTe,
+      singleRunJobAndInventionFeeIsk: singleRunJobFee + inventionCostPerRun,
+      unitInputM3: runs > 0 ? inputVolume / runs : singleRunMatVol,
+      unitOutputM3: productItem.volume * recipe.outputPerRun,
+      sourceHubId: 'jita',
+      destHubId: sellInDodixie ? 'dodixie' : 'jita',
+      bomMaterials,
+      depthWalkBuy,
+      depthWalkSell,
+      buyAllProfitIsk: netProfit,
+      buyMissingProfitIsk,
+      buyMissingCapitalIsk,
+      hangarSavingsIsk,
       steps,
       inspection: {
         summaryText: `${facilityLabel} · Live Mfg Cost Index: ${(liveMfgIndex * 100).toFixed(2)}% (${industryCosts?.source === 'esi_live' ? 'CCP ESI Live' : 'Baseline'}) · Effective ME Reduction: ${((1 - meMultiplier) * 100).toFixed(2)}% · Install Fee: ${formatIsk(totalJobFee)}${
           totalInventionCost > 0 ? ` · Vanilla T2 Invention amortized cost: ${formatIsk(totalInventionCost)}` : ''
-        }.`,
+        } · Buy All Profit: ${formatIsk(netProfit)} | Buy Missing Profit: ${formatIsk(buyMissingProfitIsk)}.`,
         columns: [
           { key: 'material', label: 'Input Material', align: 'left' },
           { key: 'qty', label: 'Quantity', align: 'right' },
-          { key: 'unitPrice', label: 'Jita Unit', align: 'right' },
+          { key: 'unitPrice', label: 'Depth Avg Unit', align: 'right' },
           { key: 'totalCost', label: 'Subtotal', align: 'right' },
           { key: 'volume', label: 'Volume', align: 'right' },
-          { key: 'sourcing', label: '1j Discount Check', align: 'left' },
+          { key: 'sourcing', label: 'Depth / 1j Check', align: 'left' },
         ],
         rows: bomRows,
       },
@@ -698,10 +863,13 @@ function computeIndyAndInvention(
             },
             {
               action: 'process',
-              systemId: EVE_ANCHORS.ISHISOMO_SYSTEM_ID,
-              systemName: EVE_ANCHORS.ISHISOMO_SYSTEM_NAME,
-              stationId: EVE_ANCHORS.ISHISOMO_MFG_STATION_ID,
-              stationName: EVE_ANCHORS.ISHISOMO_MFG_STATION_NAME,
+              systemId: structureConfig.systemId,
+              systemName: structureConfig.systemName,
+              stationId:
+                structureConfig.systemId === EVE_ANCHORS.ISHISOMO_SYSTEM_ID
+                  ? EVE_ANCHORS.ISHISOMO_MFG_STATION_ID
+                  : undefined,
+              stationName: facilityLabel,
               items: routeBuyItems,
               cargoDeltaM3: outputVolume - inputVolume,
               processNote: `Queue ${runs}× ${recipe.productName} build & load ${totalOutputUnits.toLocaleString('en-US')} finished units`,
@@ -1580,6 +1748,11 @@ function computeRegionalTradeManifests(
       grossRev: number;
       vol: number;
       profit: number;
+      buySlippagePct: number;
+      sellSlippagePct: number;
+      shortfallUnits: number;
+      weightedBuyPrice: number;
+      weightedSellPrice: number;
     }[] = [];
 
     for (const c of candidates) {
@@ -1587,16 +1760,61 @@ function computeRegionalTradeManifests(
       const skuBudget = Math.min(remainingIsk, budgetCap * 0.28);
       const maxByIsk = Math.floor(skuBudget / c.buyPrice);
       const maxByM3 = Math.floor(remainingM3 / c.volumePerUnit);
-      const qty = Math.min(c.safeMaxQty, maxByIsk, maxByM3);
+      const maxCandidateQty = Math.min(c.safeMaxQty, maxByIsk, maxByM3);
+      if (maxCandidateQty <= 0) continue;
+
+      const q = snapshot.quotes[c.typeId] ?? getQuote(snapshot, c.typeId);
+      const fromQuote = getHubQuote(q, fromHub.id, ITEM_BY_ID[c.typeId]);
+      const toQuote = getHubQuote(q, toHub.id, ITEM_BY_ID[c.typeId]);
+
+      // Walk orderbook tiers to find optimal profitable quantity before orderbook thinning erodes net margin
+      const optimalQty = findOptimalProfitableQty({
+        buyHub: fromQuote,
+        sellHub: toQuote,
+        maxQty: maxCandidateQty,
+        sellFeeRate: totalSellFeeRate,
+        executionMode,
+      });
+
+      const qty = Math.max(0, Math.min(maxCandidateQty, optimalQty));
       if (qty <= 0) continue;
 
-      const cost = qty * c.buyPrice;
-      const grossRev = qty * c.sellPrice;
+      const buyWalk = walkSellOrderbookForBuy(fromQuote, qty);
+      const sellWalk: DepthWalkResult =
+        executionMode === 'instant_fill'
+          ? walkBuyOrderbookForSell(toQuote, qty)
+          : {
+              requestedQty: qty,
+              filledQty: qty,
+              shortfallQty: 0,
+              weightedAvgPrice: c.sellPrice,
+              topOfBookPrice: c.sellPrice,
+              totalIsk: qty * c.sellPrice,
+              slippagePct: 0,
+              tiersUsed: 1,
+              isThinDepth: false,
+              sourceKind: 'live_book',
+            };
+
+      const cost = buyWalk.totalIsk > 0 ? buyWalk.totalIsk : qty * c.buyPrice;
+      const grossRev = sellWalk.totalIsk > 0 ? sellWalk.totalIsk : qty * c.sellPrice;
       const vol = qty * c.volumePerUnit;
-      const profit = qty * c.netUnitProfit;
+      const profit = grossRev * sellFeeMult - cost;
       if (profit < 350_000) continue;
 
-      packed.push({ item: c, qty, cost, grossRev, vol, profit });
+      packed.push({
+        item: c,
+        qty,
+        cost,
+        grossRev,
+        vol,
+        profit,
+        buySlippagePct: buyWalk.slippagePct,
+        sellSlippagePct: sellWalk.slippagePct,
+        shortfallUnits: buyWalk.shortfallQty + sellWalk.shortfallQty,
+        weightedBuyPrice: buyWalk.weightedAvgPrice || c.buyPrice,
+        weightedSellPrice: sellWalk.weightedAvgPrice || c.sellPrice,
+      });
       remainingIsk -= cost;
       remainingM3 -= vol;
       if (packed.length >= 10) break;
@@ -1612,6 +1830,11 @@ function computeRegionalTradeManifests(
     const totalDepthCapUnits = packed.reduce((s, p) => s + p.item.safeMaxQty, 0);
     const totalRoi = totalCost > 0 ? (totalProfit / totalCost) * 100 : 0;
     const totalNetMargin = totalGrossRev > 0 ? (totalProfit / totalGrossRev) * 100 : 0;
+    const avgBuySlippage =
+      packed.reduce((s, p) => s + p.buySlippagePct * p.cost, 0) / Math.max(1, totalCost);
+    const avgSellSlippage =
+      packed.reduce((s, p) => s + p.sellSlippagePct * p.grossRev, 0) / Math.max(1, totalGrossRev);
+    const totalShortfall = packed.reduce((s, p) => s + p.shortfallUnits, 0);
 
     const routeLabel = `${fromHub.shortName} -> ${toHub.shortName}`;
 
@@ -1620,7 +1843,7 @@ function computeRegionalTradeManifests(
       engine: 'regional_trade',
       engineLabel: `5-Hub Empire Trade (${direction === 'outbound' ? 'Outbound' : 'Backhaul'})`,
       title: `${routeLabel} · ${hullClass === 'blockade_runner' ? 'High-Value Express' : 'Bulk DST Manifest'}`,
-      subtitle: `${packed.length} SKUs capped by ${toHub.shortName} order depth (${executionMode === 'instant_fill' ? 'Instant Fill' : 'List Orders'})`,
+      subtitle: `${packed.length} SKUs depth-walked on ${fromHub.shortName}→${toHub.shortName} books (${executionMode === 'instant_fill' ? 'Instant Fill' : 'List Orders'})`,
       categories: Array.from(new Set(packed.map((p) => p.item.category))),
       primaryTypeId: packed[0]?.item.typeId,
       primaryItemName: packed[0]?.item.name,
@@ -1633,8 +1856,8 @@ function computeRegionalTradeManifests(
       marketDepthUnits: totalDepthCapUnits,
       marketDepthDetail:
         executionMode === 'instant_fill'
-          ? `Capped to live ${toHub.shortName} buy-book depth @ profitable floor ∩ 25% 7d avg`
-          : `Capped to max 25% of 7-day avg daily ${toHub.shortName} trading volume`,
+          ? `Orderbook depth-walked @ ${toHub.shortName} buy tiers (avg drift ${avgSellSlippage.toFixed(1)}%)`
+          : `Depth-walked buy side (+${avgBuySlippage.toFixed(1)}% drift) · max 25% 7d avg vol`,
       outputUnits: totalQty,
       perUnitNetProfitIsk: totalQty > 0 ? totalProfit / totalQty : 0,
       netProfitIsk: totalProfit,
@@ -1645,25 +1868,66 @@ function computeRegionalTradeManifests(
       salesTaxPct,
       brokerFeePct,
       destinationRegionId: toHub.regionId,
-      riskLabel: totalCost > 650_000_000 && hullClass !== 'blockade_runner' ? 'Watch Depth' : 'High Margin',
+      riskLabel:
+        totalShortfall > 0 || avgBuySlippage > 3.5 || (totalCost > 650_000_000 && hullClass !== 'blockade_runner')
+          ? 'Watch Depth'
+          : 'High Margin',
+      // v2.1.0 Interactive Qty Slicer & Depth-Walk metadata
+      isEditableQty: true,
+      qtyUnitLabel: 'units',
+      baseBatchQty: totalQty,
+      optimalProfitableQty: totalQty,
+      unitInputM3: totalQty > 0 ? totalVol / totalQty : 1,
+      unitOutputM3: totalQty > 0 ? totalVol / totalQty : 1,
+      sourceHubId: fromHub.id,
+      destHubId: toHub.id,
+      depthWalkBuy: {
+        requestedQty: totalQty,
+        filledQty: Math.max(0, totalQty - totalShortfall),
+        shortfallQty: totalShortfall,
+        weightedAvgPrice: totalQty > 0 ? totalCost / totalQty : 0,
+        topOfBookPrice:
+          totalQty > 0 ? packed.reduce((s, p) => s + p.item.buyPrice * p.qty, 0) / totalQty : 0,
+        totalIsk: totalCost,
+        slippagePct: avgBuySlippage,
+        tiersUsed: packed.length,
+        isThinDepth: avgBuySlippage > 3.5 || totalShortfall > 0,
+        sourceKind: 'live_book',
+      },
+      depthWalkSell:
+        executionMode === 'instant_fill'
+          ? {
+              requestedQty: totalQty,
+              filledQty: Math.max(0, totalQty - totalShortfall),
+              shortfallQty: totalShortfall,
+              weightedAvgPrice: totalQty > 0 ? totalGrossRev / totalQty : 0,
+              topOfBookPrice:
+                totalQty > 0 ? packed.reduce((s, p) => s + p.item.sellPrice * p.qty, 0) / totalQty : 0,
+              totalIsk: totalGrossRev,
+              slippagePct: avgSellSlippage,
+              tiersUsed: packed.length,
+              isThinDepth: Math.abs(avgSellSlippage) > 3.5 || totalShortfall > 0,
+              sourceKind: 'live_book',
+            }
+          : undefined,
       steps: [
-        `Buy ${packed.length} manifest lines at ${fromHub.stationName} totaling ${formatIsk(totalCost)} (${formatM3(totalVol)} / ${((totalVol / maxCargoM3) * 100).toFixed(0)}% hull fill).`,
+        `Buy ${packed.length} depth-walked manifest lines at ${fromHub.stationName} totaling ${formatIsk(totalCost)} (${formatM3(totalVol)} / ${((totalVol / maxCargoM3) * 100).toFixed(0)}% hull fill).`,
         `Transit high-sec Empire corridor (${fromHub.shortName} -> ${toHub.shortName}) using ${
           hullClass === 'blockade_runner' ? 'covert cloak + MWD warp trick' : 'MWD + Cloak trick & gatecamp intel check'
         }.`,
         `${executionMode === 'instant_fill' ? 'Instant-sell into buy orders' : 'List sell orders'} at ${toHub.stationName} for ${formatIsk(totalProfit)} true after-tax profit (${totalNetMargin.toFixed(1)}% Net Margin · Tax ${salesTaxPct.toFixed(2)}%${brokerFeePct > 0 ? ` + Broker ${brokerFeePct.toFixed(2)}%` : ' · 0% Broker'}).`,
       ],
       inspection: {
-        summaryText: `5-Hub Empire Trade manifest (${fromHub.shortName} -> ${toHub.shortName}) honoring active float (${formatIsk(budgetCap)}), ${hullLabel} cargo limit, and realistic ${toHub.shortName} market depth.`,
+        summaryText: `5-Hub Empire Trade manifest (${fromHub.shortName} -> ${toHub.shortName}) using tier-by-tier orderbook depth walking (Buy drift ${avgBuySlippage >= 0 ? '+' : ''}${avgBuySlippage.toFixed(2)}%, Sell drift ${avgSellSlippage.toFixed(2)}%).`,
         columns: [
           { key: 'item', label: 'SKU', align: 'left' },
           { key: 'qty', label: 'Qty', align: 'right' },
-          { key: 'buy', label: `${fromHub.shortName} Sell`, align: 'right' },
+          { key: 'buy', label: `${fromHub.shortName} Avg Buy`, align: 'right' },
           {
             key: 'sell',
             label:
               executionMode === 'instant_fill'
-                ? `${toHub.shortName} Buy`
+                ? `${toHub.shortName} Avg Bid`
                 : `${toHub.shortName} Sell`,
             align: 'right',
           },
@@ -1676,11 +1940,11 @@ function computeRegionalTradeManifests(
           _itemName: p.item.name,
           item: p.item.name,
           qty: p.qty.toLocaleString('en-US'),
-          buy: formatIsk(p.item.buyPrice, false),
-          sell: formatIsk(p.item.sellPrice, false),
+          buy: formatIsk(p.weightedBuyPrice, false),
+          sell: formatIsk(p.weightedSellPrice, false),
           vol: formatM3(p.vol),
           profit: formatIsk(p.profit),
-          roi: formatPct(p.item.roiPct),
+          roi: formatPct((p.profit / Math.max(1, p.cost)) * 100),
         })),
       },
       routeChains: [

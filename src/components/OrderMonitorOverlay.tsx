@@ -13,6 +13,10 @@ import {
 } from 'lucide-react';
 import { formatIsk } from '../engines/decisionEngines.ts';
 import type { OrderMonitorSnapshot, PilotProfile } from '../types/eve.ts';
+import {
+  computeEve4SigFigTick,
+  computeRelistFeePreview,
+} from '../utils/eveMarketMath.ts';
 import { copyTextToClipboard } from '../utils/eveMultibuy.ts';
 
 interface OrderMonitorOverlayProps {
@@ -149,6 +153,7 @@ export function OrderMonitorOverlay({
   onOpenSsoSetup,
 }: OrderMonitorOverlayProps) {
   const [filter, setFilter] = useState<OrderFilter>('all');
+  const [selectedOrderId, setSelectedOrderId] = useState<number | null>(null);
   const [copiedOrderId, setCopiedOrderId] = useState<number | null>(null);
   const [openingTypeId, setOpeningTypeId] = useState<number | null>(null);
   const copyTimerRef = useRef<number | null>(null);
@@ -373,14 +378,37 @@ export function OrderMonitorOverlay({
                     </tr>
                   </thead>
                   <tbody className="divide-y divide-slate-800/60">
-                    {filteredOrders.map((order) => (
+                    {filteredOrders.map((order) => {
+                      const exactTick = order.isUndercut
+                        ? computeEve4SigFigTick(
+                            order.marketBestPrice,
+                            order.isBuyOrder ? 'outbid_buy' : 'undercut_sell'
+                          )
+                        : order.myPrice;
+                      const relistPreview = order.isUndercut
+                        ? computeRelistFeePreview({
+                            oldPrice: order.myPrice,
+                            newPrice: exactTick,
+                            volumeRemain: order.volumeRemain,
+                            isBuyOrder: order.isBuyOrder,
+                            brokerRelationsLvl: profile.skills.brokerRelations,
+                            advBrokerRelationsLvl: profile.skills.advancedBrokerRelations ?? 0,
+                            accountingLvl: profile.skills.accounting,
+                          })
+                        : null;
+                      const isRowSelected = selectedOrderId === order.orderId;
+
+                      return (
                       <tr
                         key={order.orderId}
-                        className={
-                          order.isUndercut
-                            ? 'bg-rose-500/5 hover:bg-rose-500/10 transition-colors'
-                            : 'hover:bg-slate-800/30 transition-colors'
-                        }
+                        onClick={() => setSelectedOrderId(order.orderId)}
+                        className={`cursor-pointer transition-all ${
+                          isRowSelected
+                            ? 'bg-cyan-500/12 shadow-[inset_3px_0_0_#22d3ee,inset_0_1px_10px_rgba(34,211,238,0.12)]'
+                            : order.isUndercut
+                              ? 'bg-rose-500/5 hover:bg-rose-500/10'
+                              : 'hover:bg-slate-800/30'
+                        }`}
                       >
                         <td className="py-2.5 px-3">
                           <div className="font-medium text-slate-100">{order.itemName}</div>
@@ -422,16 +450,29 @@ export function OrderMonitorOverlay({
                           )}
                         </td>
                         <td className="py-2.5 px-3 text-right font-mono tabular-nums whitespace-nowrap">
-                          {order.isUndercut ? (
+                          {order.isUndercut && relistPreview ? (
                             <div>
                               <div className="inline-flex items-center gap-1 text-amber-300 font-semibold">
                                 <AlertTriangle className="w-3 h-3 text-rose-400" aria-hidden="true" />
-                                <span>{formatIsk(order.suggestedReclaimPrice, false)}</span>
+                                <span>{formatIsk(exactTick, false)}</span>
                               </div>
-                              <div className="text-[10px] text-rose-300">
-                                Adjust {order.deltaIsk >= 0 ? '+' : ''}
-                                {formatIsk(order.deltaIsk, false)}
+                              <div className="text-[10px] text-slate-400">
+                                Relist Fee: <span className="text-amber-300">{formatIsk(relistPreview.modificationFeeIsk)}</span>
+                                {relistPreview.estimatedNetMarginPct !== null && (
+                                  <span
+                                    className={`ml-1.5 ${
+                                      relistPreview.unprofitableWarning ? 'text-rose-400 font-bold' : 'text-emerald-400'
+                                    }`}
+                                  >
+                                    ({relistPreview.estimatedNetMarginPct.toFixed(1)}% net)
+                                  </span>
+                                )}
                               </div>
+                              {relistPreview.unprofitableWarning && (
+                                <div className="mt-0.5 inline-flex items-center gap-1 px-1.5 py-0.5 rounded bg-rose-500/20 border border-rose-500/50 text-[9px] font-bold text-rose-300 animate-pulse">
+                                  UNPROFITABLE AFTER RELIST
+                                </div>
+                              )}
                             </div>
                           ) : (
                             <span className="inline-flex items-center gap-1 text-emerald-400 font-medium">
@@ -440,22 +481,21 @@ export function OrderMonitorOverlay({
                             </span>
                           )}
                         </td>
-                        <td className="py-2.5 px-3 text-right whitespace-nowrap">
+                        <td className="py-2.5 px-3 text-right whitespace-nowrap" onClick={(e) => e.stopPropagation()}>
                           <div className="inline-flex items-center gap-1.5">
                             {order.isUndercut && (
                               <button
                                 type="button"
-                                onClick={() =>
-                                  handleCopyReclaimPrice(
-                                    order.orderId,
-                                    order.suggestedReclaimPrice
-                                  )
-                                }
-                                title="Copy exact reclaim price to clipboard for EVE Modify Order"
+                                onClick={() => handleCopyReclaimPrice(order.orderId, exactTick)}
+                                title={`Copy exact 4-sig-fig tick (${exactTick}) · Relist fee ${
+                                  relistPreview ? formatIsk(relistPreview.modificationFeeIsk) : '100 ISK'
+                                } (${relistPreview?.relistDiscountPct.toFixed(0)}% Adv Broker disc)`}
                                 className={`inline-flex items-center gap-1 px-2 py-1 rounded border text-[11px] font-medium transition-colors cursor-pointer ${
                                   copiedOrderId === order.orderId
                                     ? 'border-emerald-400/60 bg-emerald-500/20 text-emerald-200'
-                                    : 'border-amber-500/40 bg-amber-500/10 text-amber-200 hover:bg-amber-500/20'
+                                    : relistPreview?.unprofitableWarning
+                                      ? 'border-rose-500/60 bg-rose-500/15 text-rose-200 hover:bg-rose-500/25'
+                                      : 'border-amber-500/40 bg-amber-500/10 text-amber-200 hover:bg-amber-500/20'
                                 }`}
                               >
                                 {copiedOrderId === order.orderId ? (
@@ -464,7 +504,7 @@ export function OrderMonitorOverlay({
                                   <Copy className="w-3 h-3" aria-hidden="true" />
                                 )}
                                 <span>
-                                  {copiedOrderId === order.orderId ? 'Copied' : 'Copy Price'}
+                                  {copiedOrderId === order.orderId ? 'Copied Tick' : 'Copy Tick Price'}
                                 </span>
                               </button>
                             )}
@@ -481,7 +521,8 @@ export function OrderMonitorOverlay({
                           </div>
                         </td>
                       </tr>
-                    ))}
+                      );
+                    })}
                   </tbody>
                 </table>
               </div>

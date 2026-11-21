@@ -756,7 +756,7 @@ export function RouteOptimizerSidebar({
   return (
     <aside
       aria-label="Fleet Logistics, Threat Intel and Autopilot Planner"
-      className="w-full lg:w-[430px] xl:w-[470px] shrink-0 bg-[#0e131b] border-t lg:border-t-0 lg:border-l border-slate-800/90 flex flex-col h-[640px] lg:h-full"
+      className="w-full shrink-0 bg-[#0e131b] border-t lg:border-t-0 flex flex-col h-[640px] lg:h-full"
     >
       {/* Sidebar Header + Right-Rail Switcher */}
       <div className="px-4 py-3 border-b border-slate-800/90 flex items-center justify-between gap-2 shrink-0">

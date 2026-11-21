@@ -50,6 +50,7 @@ export interface EveItem {
 export interface OrderBookLevel {
   price: number;
   volume: number;
+  minVolume?: number;
 }
 
 export interface HubQuote {
@@ -61,7 +62,11 @@ export interface HubQuote {
   buyPercentile: number;
   topBuyDepthUnits?: number; // Live buy-order volume within top price tiers
   buyLevels?: OrderBookLevel[]; // Descending price buckets from live ESI order book
+  sellLevels?: OrderBookLevel[]; // Ascending price buckets from live ESI order book
   avgDailyVol7d?: number; // 7-day average daily traded volume from ESI /markets/{region_id}/history/
+  yesterdayAvgPrice?: number; // Yesterday's ESI daily average price for 24h trend delta
+  prevSessionSellMin?: number; // Previous 5-min refresh sellMin for session tick delta
+  prevSessionBuyMax?: number; // Previous 5-min refresh buyMax for session tick delta
 }
 
 export interface CorridorOrder {
@@ -160,6 +165,7 @@ export interface MarketSnapshot {
   sourceMode: 'live' | 'partial' | 'baseline';
   syncError?: string | null;
   esiRateLimit?: EsiRateLimitState;
+  cacheTelemetry?: MarketCacheTelemetry;
 }
 
 export interface BlueprintEntry {
@@ -266,7 +272,13 @@ export interface ActiveOrderConflict {
   price: number;
 }
 
-export type IndustryStructureType = 'npc_station' | 'raitaru' | 'azbel' | 'sotiyo';
+export type IndustryStructureType =
+  | 'npc_station'
+  | 'raitaru'
+  | 'azbel'
+  | 'sotiyo'
+  | 'athanor'
+  | 'tatara';
 export type RigTier = 'none' | 't1' | 't2';
 
 export interface IndustryStructureConfig {
@@ -364,6 +376,7 @@ export interface OrderMonitorSnapshot {
   realizedProfit24hIsk: number;
   realizedProfit7dIsk: number;
   syncedAt: string;
+  cacheMeta?: MarketCacheTelemetry;
 }
 
 export interface WatchlistItem {
@@ -392,12 +405,15 @@ export interface PilotProfile {
   skills: {
     accounting: number; // 16622: 7.5% * (1 - 0.11 * lvl) -> 3.375% at V
     brokerRelations: number; // 3446: 3.0% - (0.3% * lvl) -> 1.5% at V
+    advancedBrokerRelations?: number; // 3447: 50% + 6%/lvl relist modification fee discount (80% at V)
     procurement: number; // 16596: Remote Buy Order range (0=Station, 1=System, 2=5j, 3=10j, 4=20j, 5=Region)
     marketing: number; // 16598: Remote Sell Order range (0=Station, 1=System, 2=5j, 3=10j, 4=20j, 5=Region)
     reprocessing: number; // 5
     reprocessingEfficiency: number; // 5
     scrapmetalProcessing: number; // 5
-    industry: number; // 5
+    industry: number; // 3380: -4%/lvl build time
+    advancedIndustry?: number; // 3388: -3%/lvl build & research time
+    reactions?: number; // 45746: -4%/lvl reaction time & +1 reaction slot/lvl
     scienceEncryption: number; // 5
     massProduction?: number; // 3387: +1 mfg slot/lvl
     advancedMassProduction?: number; // 24625: +1 mfg slot/lvl
@@ -600,6 +616,185 @@ export interface OptimizedRouteResult {
   hotSystemIdsOnRoute: number[];
 }
 
+export interface DepthWalkResult {
+  requestedQty: number;
+  filledQty: number;
+  shortfallQty: number;
+  topOfBookPrice: number;
+  weightedAvgPrice: number;
+  totalIsk: number;
+  slippagePct: number; // Positive = paying more (buy) or receiving less (sell) than top-of-book
+  tiersUsed: number;
+  isThinDepth: boolean; // True if slippage >= 2.5% or shortfall > 0
+  sourceKind: 'live_book' | 'synthesized_curve';
+}
+
+export interface BomMaterialSpec {
+  typeId: number;
+  name: string;
+  qtyPerRun: number;
+  unitVolumeM3: number;
+  unitPriceTopOfBook: number;
+  depthWalk?: DepthWalkResult;
+  sellLevels?: OrderBookLevel[];
+  fallbackSellVolume?: number;
+}
+
+export interface BuildQueueEntry {
+  cardId: string;
+  title: string;
+  productTypeId: number;
+  productName: string;
+  committedRuns: number;
+  outputPerRun: number;
+  allocatedSlots: number;
+  priorityOrder: number;
+  addedAt: string;
+}
+
+export interface VirtualHangarMaterialRow {
+  typeId: number;
+  name: string;
+  requiredQty: number;
+  availableBeforeSlot: number;
+  reservedQty: number;
+  missingQty: number;
+  remainingAfterSlot: number;
+  unitVolumeM3: number;
+  buyAllCostIsk: number;
+  buyMissingCostIsk: number;
+  depthWalkMissing?: DepthWalkResult;
+}
+
+export interface VirtualHangarSlotAllocation {
+  cardId: string;
+  title: string;
+  productName: string;
+  priorityOrder: number;
+  committedRuns: number;
+  totalOutputUnits: number;
+  allocatedSlots: number;
+  sequentialDurationSec: number;
+  concurrentDurationSec: number;
+  materials: VirtualHangarMaterialRow[];
+  buyAllCostIsk: number;
+  buyMissingCostIsk: number;
+  jobAndInventionFeeIsk: number;
+  netRevenueIsk: number;
+  buyAllProfitIsk: number;
+  buyMissingProfitIsk: number;
+  rawInputM3: number;
+  packagedOutputM3: number;
+}
+
+export interface GlobalMultibuyMaterial {
+  typeId: number;
+  name: string;
+  totalMissingQty: number;
+  totalReservedQty: number;
+  unitVolumeM3: number;
+  totalVolumeM3: number;
+  topOfBookPrice: number;
+  weightedAvgPrice: number;
+  totalCostIsk: number;
+  slippagePct: number;
+  shortfallQty: number;
+  status: 'in_stock' | 'thin_depth' | 'shortfall';
+}
+
+export interface RelistFeePreview {
+  oldPrice: number;
+  newPrice: number;
+  tickDelta: number;
+  brokerFeePct: number;
+  relistDiscountPct: number; // 50% + 6% * Advanced Broker Relations
+  modificationFeeIsk: number; // Min 100 ISK
+  newOrderValueIsk: number;
+  estimatedNetMarginPct: number | null;
+  unprofitableWarning: boolean;
+  warningReason?: string;
+}
+
+export interface HaulerFitModule {
+  slot: 'Hull' | 'High' | 'Mid' | 'Low' | 'Rig';
+  typeId: number;
+  name: string;
+  qty: number;
+  unitPriceIsk: number;
+  totalPriceIsk: number;
+}
+
+export interface HaulerFitSuggestion {
+  rawInputM3: number;
+  packagedOutputM3: number;
+  peakHaulM3: number;
+  cargoIskValue: number;
+  originSystemName: string;
+  destSystemName: string;
+  jumpCount: number;
+  routeMinSec: number;
+  routeSecurityLabel: string;
+  ownedHullName: string | null;
+  ownedHullCapM3: number;
+  ownedHullTrips: number;
+  recommendedClass: 't1_industrial' | 'blockade_runner' | 'dst' | 'freighter';
+  recommendedClassLabel: string;
+  recommendedHullTypeId: number;
+  recommendedHullName: string;
+  recommendedHullCapM3: number;
+  recommendedTrips: number;
+  indicativeHullCostIsk: number;
+  totalFitCostIsk: number;
+  gankRiskReason: string;
+  fitModules: HaulerFitModule[];
+  multibuyText: string;
+}
+
+export interface MarketCacheTelemetry {
+  expiresAtMs: number | null;
+  lastRefreshedAt?: string | null;
+  ratelimitRemaining: number | null;
+  retryAfterSec: number | null;
+  from304Count: number;
+  zeroTokenHits: number;
+  mode?: 'active_sync' | 'background_watchdog';
+  tabHidden?: boolean;
+  watchdogActive?: boolean;
+  watchdogTrackedOrders?: number;
+  watchdogLastPollAt?: string | null;
+}
+
+export interface PriceProjectionAnalysis {
+  typeId: number;
+  itemName: string;
+  regionId: number;
+  regionName: string;
+  currentAvgPrice: number;
+  yesterdayAvgPrice: number;
+  change24hPct: number;
+  ma7d: number;
+  ma30d: number;
+  momentum7dPct: number;
+  avgDailyVol7d: number;
+  avgDailyVol30d: number;
+  volumeSpikeRatio: number;
+  volatilityPct: number;
+  manipulationRisk: 'low' | 'moderate' | 'high';
+  manipulationNotes: string[];
+  signal: 'bullish' | 'neutral' | 'bearish' | 'caution_thin';
+  signalSummary: string;
+  projected7dLow: number;
+  projected7dMid: number;
+  projected7dHigh: number;
+}
+
+export interface AiCommentarySettings {
+  enabled: boolean;
+  provider: 'gemini' | 'openai';
+  geminiKey: string;
+  openaiKey: string;
+}
+
 export interface ActionCardData {
   id: string;
   engine: EngineId;
@@ -632,6 +827,29 @@ export interface ActionCardData {
   steps: string[];
   inspection: InspectionPayload;
   routeChains: RouteChain[];
+  // v2.1.0 Depth-Walking, Slicer, Dual Profit & Build Time Metadata
+  isEditableQty?: boolean;
+  qtyUnitLabel?: 'runs' | 'units';
+  baseBatchQty?: number; // Default runs (indy) or units (trade)
+  optimalProfitableQty?: number; // Max profitable qty before depth thinning erodes margin
+  outputPerRun?: number; // For indy build cards
+  unitInputM3?: number; // Per-run input volume (indy) or per-unit volume (trade)
+  unitOutputM3?: number; // Per-run output volume (indy) or per-unit volume (trade)
+  baseRunDurationSec?: number; // Base blueprint run duration before skills/structure TE
+  isReactionRecipe?: boolean;
+  recipeTier?: 'T1' | 'T2';
+  bpMe?: number;
+  bpTe?: number;
+  singleRunJobAndInventionFeeIsk?: number;
+  bomMaterials?: BomMaterialSpec[];
+  depthWalkBuy?: DepthWalkResult;
+  depthWalkSell?: DepthWalkResult;
+  buyAllProfitIsk?: number;
+  buyMissingProfitIsk?: number;
+  buyMissingCapitalIsk?: number;
+  hangarSavingsIsk?: number;
+  sourceHubId?: TradeHubId;
+  destHubId?: TradeHubId;
 }
 
 export interface MarketHistoryDay {
@@ -682,6 +900,12 @@ export interface LiveOrderBookResponse {
   buySystemRegionId?: number;
   jumpsToBuySystem?: number;
   sameRegion?: boolean;
+  yesterdayAvgPrice?: number;
+  prevSessionSellMin?: number;
+  prevSessionBuyMax?: number;
+  cacheExpiresAt?: string;
+  ratelimitRemaining?: number | null;
+  from304Cache?: boolean;
   fetchedAt: string;
 }
 

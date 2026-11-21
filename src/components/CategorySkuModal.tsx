@@ -1,5 +1,6 @@
 import { useMemo, useState } from 'react';
-import { Layers, LineChart, Search, X } from 'lucide-react';
+import { Layers, LineChart, Search, Sparkles, X } from 'lucide-react';
+import { EVE_ANCHORS } from '../data/eveCatalog.ts';
 import { formatIsk } from '../engines/decisionEngines.ts';
 import type {
   CatalogSku,
@@ -15,6 +16,12 @@ interface CategorySkuModalProps {
   snapshot: MarketSnapshot;
   minDailyVolume: number;
   onOpenHistory: (typeId: number, name: string) => void;
+  onOpenPriceProjection?: (target: {
+    typeId: number;
+    itemName: string;
+    regionId?: number;
+    currentPrice?: number;
+  }) => void;
   onClose: () => void;
 }
 
@@ -28,11 +35,13 @@ export function CategorySkuModal({
   snapshot,
   minDailyVolume,
   onOpenHistory,
+  onOpenPriceProjection,
   onClose,
 }: CategorySkuModalProps) {
   const [query, setQuery] = useState('');
   const [liveOnly, setLiveOnly] = useState(false);
   const [showAll, setShowAll] = useState(false);
+  const [selectedTypeId, setSelectedTypeId] = useState<number | null>(null);
 
   const enriched = useMemo(() => {
     return skus.map((sku) => {
@@ -186,14 +195,21 @@ export function CategorySkuModal({
                   <th className="py-2 px-3 text-right font-medium">Jita Sell</th>
                   <th className="py-2 px-3 text-right font-medium">Dodixie Sell</th>
                   <th className="py-2 px-3 text-right font-medium">Est. Daily Vol</th>
-                  <th className="py-2 px-3 text-center font-medium w-12">30d</th>
+                  <th className="py-2 px-3 text-center font-medium w-20">Analysis</th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-slate-800/60">
-                {visibleRows.map(({ sku, quote, hasLive, estVol, meetsVolume }) => (
+                {visibleRows.map(({ sku, quote, hasLive, estVol, meetsVolume }) => {
+                  const isSelected = selectedTypeId === sku.typeId;
+                  return (
                   <tr
                     key={sku.typeId}
-                    className="hover:bg-slate-800/35 transition-colors"
+                    onClick={() => setSelectedTypeId(sku.typeId)}
+                    className={
+                      isSelected
+                        ? 'bg-cyan-500/[0.09] shadow-[inset_3px_0_0_#22d3ee,inset_0_1px_0_rgba(34,211,238,0.12)] transition-colors cursor-pointer'
+                        : 'hover:bg-slate-800/35 transition-colors cursor-pointer'
+                    }
                   >
                     <td className="py-2 px-4 text-slate-100 font-medium">
                       {sku.name}
@@ -230,18 +246,38 @@ export function CategorySkuModal({
                     >
                       {estVol > 0 ? estVol.toLocaleString() : '—'}
                     </td>
-                    <td className="py-2 px-3 text-center">
-                      <button
-                        type="button"
-                        onClick={() => onOpenHistory(sku.typeId, sku.name)}
-                        title={`View 30-day ESI market history for ${sku.name}`}
-                        className="p-1 rounded text-slate-400 hover:text-cyan-300 hover:bg-slate-800 transition-colors cursor-pointer"
-                      >
-                        <LineChart className="w-3.5 h-3.5" />
-                      </button>
+                    <td className="py-2 px-3 text-center" onClick={(e) => e.stopPropagation()}>
+                      <div className="inline-flex items-center gap-1">
+                        {onOpenPriceProjection && (
+                          <button
+                            type="button"
+                            onClick={() =>
+                              onOpenPriceProjection({
+                                typeId: sku.typeId,
+                                itemName: sku.name,
+                                regionId: EVE_ANCHORS.THE_FORGE_REGION_ID,
+                                currentPrice: hasLive && quote ? quote.jita.sellMin : undefined,
+                              })
+                            }
+                            title={`Price projection & trend analysis for ${sku.name}`}
+                            className="p-1 rounded text-indigo-300 hover:text-indigo-200 hover:bg-indigo-500/20 transition-colors cursor-pointer"
+                          >
+                            <Sparkles className="w-3.5 h-3.5" />
+                          </button>
+                        )}
+                        <button
+                          type="button"
+                          onClick={() => onOpenHistory(sku.typeId, sku.name)}
+                          title={`View 30-day ESI market history for ${sku.name}`}
+                          className="p-1 rounded text-slate-400 hover:text-cyan-300 hover:bg-slate-800 transition-colors cursor-pointer"
+                        >
+                          <LineChart className="w-3.5 h-3.5" />
+                        </button>
+                      </div>
                     </td>
                   </tr>
-                ))}
+                  );
+                })}
               </tbody>
             </table>
           )}

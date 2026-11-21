@@ -176,7 +176,7 @@ export function AdvisorSidebar({
   return (
     <aside
       aria-label="Gemini AI Strategic Advisor"
-      className="w-full lg:w-[375px] xl:w-[415px] shrink-0 bg-[#0e131b] border-t lg:border-t-0 lg:border-l border-slate-800/90 flex flex-col h-[540px] lg:h-full"
+      className="w-full shrink-0 bg-[#0e131b] border-t lg:border-t-0 flex flex-col h-[540px] lg:h-full"
     >
       {/* Sidebar Header */}
       <div className="px-4 py-3.5 border-b border-slate-800/90 flex items-center justify-between gap-2 shrink-0">

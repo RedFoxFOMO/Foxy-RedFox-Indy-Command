@@ -16,7 +16,10 @@ import { ActionCard } from './components/ActionCard.tsx';
 import { AdvisorSidebar } from './components/AdvisorSidebar.tsx';
 import { ApiSetupModal } from './components/ApiSetupModal.tsx';
 import { BlueprintLibraryPanel } from './components/BlueprintLibraryPanel.tsx';
+import { BuildQueueAndLedgerPanel } from './components/BuildQueueAndLedgerPanel.tsx';
 import { CategorySkuModal } from './components/CategorySkuModal.tsx';
+import { HaulerFitFlyout } from './components/HaulerFitFlyout.tsx';
+import type { HaulerFlyoutContext } from './components/HaulerFitFlyout.tsx';
 import { IndustryFacilityBar } from './components/IndustryFacilityBar.tsx';
 import { IndustryJobsPanel } from './components/IndustryJobsPanel.tsx';
 import { InspectDrawer } from './components/InspectDrawer.tsx';
@@ -25,6 +28,7 @@ import { MarketHistoryModal } from './components/MarketHistoryModal.tsx';
 import { MarketScopeBar } from './components/MarketScopeBar.tsx';
 import { OrderMonitorOverlay } from './components/OrderMonitorOverlay.tsx';
 import { OverviewProfitChart } from './components/OverviewProfitChart.tsx';
+import { PriceProjectionModal } from './components/PriceProjectionModal.tsx';
 import { RouteOptimizerSidebar } from './components/RouteOptimizerSidebar.tsx';
 import { SettingsModal } from './components/SettingsModal.tsx';
 import { TopBar } from './components/TopBar.tsx';
@@ -49,7 +53,9 @@ import {
 import type {
   ActionCardData,
   AdvisorAction,
+  AiCommentarySettings,
   AppStateSummary,
+  BuildQueueEntry,
   ChatMessage,
   CorridorOrder,
   CustomShoppingItem,
@@ -58,6 +64,7 @@ import type {
   EsiRateLimitState,
   IndustryCostSnapshot,
   IndustryStructureConfig,
+  MarketCacheTelemetry,
   MarketCategoryDef,
   MarketCategoryId,
   MarketQuote,
@@ -72,8 +79,10 @@ import type {
 } from './types/eve.ts';
 import {
   getCurrentCallbackUrl,
+  loadAiCommentarySettings,
   loadCustomEveClientId,
   loadCustomGeminiKey,
+  saveAiCommentarySettings,
   saveCustomEveClientId,
   saveCustomGeminiKey,
 } from './utils/apiKeys.ts';
@@ -83,6 +92,7 @@ import {
   fetchHubQuotesDirect,
   fetchIndustryCostIndicesClient,
   fetchOrderMonitorClient,
+  pollUndercutWatchdogClient,
 } from './utils/esiClientFallback.ts';
 import { buildEveAuthorizeUrl } from './utils/evePkce.ts';
 import {
@@ -191,6 +201,29 @@ function loadStoredBoolean(key: string, fallback: boolean): boolean {
   return fallback;
 }
 
+function loadStoredBuildQueue(): BuildQueueEntry[] {
+  try {
+    const raw = localStorage.getItem('foxy_build_queue_v21');
+    if (raw) {
+      const parsed = JSON.parse(raw) as BuildQueueEntry[];
+      if (Array.isArray(parsed)) return parsed;
+    }
+  } catch {
+    // ignore
+  }
+  return [];
+}
+
+function loadStoredRightPanePct(): number {
+  try {
+    const raw = Number(localStorage.getItem('foxy_split_pane_right_pct_v21'));
+    if (Number.isFinite(raw) && raw >= 24 && raw <= 64) return raw;
+  } catch {
+    // ignore
+  }
+  return 34;
+}
+
 export default function App() {
   const [activeView, setActiveView] = useState<WorkspaceView>('overview');
   const [checkedCategories, setCheckedCategories] = useState<MarketCategoryId[]>(
@@ -231,6 +264,26 @@ export default function App() {
   const [orderMonitorError, setOrderMonitorError] = useState<string | null>(null);
   const [isRefreshingJobs, setIsRefreshingJobs] = useState(false);
   const [jobsError, setJobsError] = useState<string | null>(null);
+
+  // v2.1.0 ESI Cache Shield Telemetry, Slicer Single Source of Truth, Multi-Slot Build Queue,
+  // Hauler Flyout, Price Projection Modal (with BYOK AI settings), Selected Card, and Split-Pane Divider
+  const [cacheTelemetry, setCacheTelemetry] = useState<MarketCacheTelemetry | null>(null);
+  const [qtyOverridesByCardId, setQtyOverridesByCardId] = useState<Record<string, number>>({});
+  const [buildQueue, setBuildQueue] = useState<BuildQueueEntry[]>(loadStoredBuildQueue);
+  const [selectedCardId, setSelectedCardId] = useState<string | null>(null);
+  const [haulerFlyoutContext, setHaulerFlyoutContext] = useState<HaulerFlyoutContext | null>(null);
+  const [priceProjectionTarget, setPriceProjectionTarget] = useState<{
+    typeId: number;
+    itemName: string;
+    regionId?: number;
+    currentPrice?: number;
+  } | null>(null);
+  const [aiSettings, setAiSettings] = useState<AiCommentarySettings>(() =>
+    loadAiCommentarySettings()
+  );
+  const [rightPanePct, setRightPanePct] = useState<number>(loadStoredRightPanePct);
+  const [isDraggingSplit, setIsDraggingSplit] = useState(false);
+  const splitContainerRef = useRef<HTMLDivElement | null>(null);
 
   const [profile, setProfile] = useState<PilotProfile>(DEFAULT_SIMULATION_PROFILE);
 
@@ -597,7 +650,12 @@ export default function App() {
         if (!res.ok) {
           throw new Error(`Market sync returned HTTP ${res.status}`);
         }
-        const data = (await res.json()) as MarketSnapshot;
+        const data = (await res.json()) as MarketSnapshot & {
+          cacheTelemetry?: MarketCacheTelemetry;
+        };
+        if (data.cacheTelemetry) {
+          setCacheTelemetry(data.cacheTelemetry);
+        }
         if (data.esiRateLimit) {
           setEsiRateLimit(data.esiRateLimit);
           setNowTick(Date.now());
@@ -748,9 +806,13 @@ export default function App() {
           corridorOrders?: CorridorOrder[];
           liveCount?: number;
           esiRateLimit?: EsiRateLimitState;
+          cacheTelemetry?: MarketCacheTelemetry;
           error?: string;
         };
 
+        if (data.cacheTelemetry) {
+          setCacheTelemetry(data.cacheTelemetry);
+        }
         if (data.esiRateLimit) {
           setEsiRateLimit(data.esiRateLimit);
           setNowTick(Date.now());
@@ -874,12 +936,142 @@ export default function App() {
   }, [catalogCooldownRemainingSec, isCatalogLoading, rateLimitPauseRemainingSec]);
 
   // Initial sync & re-sync whenever checked categories or 5-hub trade pair change
+  // Respects document.hidden so hidden browser tabs pause general market browsing
   useEffect(() => {
+    if (typeof document !== 'undefined' && document.hidden) return;
     const timer = setTimeout(() => {
       syncLiveMarkets(checkedCategories, false, [sourceHub, destHub]);
     }, 180);
     return () => clearTimeout(timer);
   }, [checkedCategories, sourceHub, destHub, syncLiveMarkets]);
+
+  // Persist build queue & BYOK AI commentary settings
+  useEffect(() => {
+    try {
+      localStorage.setItem('foxy_build_queue_v21', JSON.stringify(buildQueue));
+    } catch {
+      // ignore
+    }
+  }, [buildQueue]);
+
+  const handleChangeAiSettings = useCallback((next: AiCommentarySettings) => {
+    setAiSettings(next);
+    saveAiCommentarySettings(next);
+  }, []);
+
+  // Resizable vertical split-pane drag handlers (center workspace <-> right docked panel)
+  useEffect(() => {
+    if (!isDraggingSplit) return;
+    const handleMouseMove = (e: MouseEvent) => {
+      const el = splitContainerRef.current;
+      if (!el) return;
+      const rect = el.getBoundingClientRect();
+      if (rect.width <= 0) return;
+      const rightWidthPx = rect.right - e.clientX;
+      const pct = Math.max(24, Math.min(64, Number(((rightWidthPx / rect.width) * 100).toFixed(1))));
+      setRightPanePct(pct);
+    };
+    const handleMouseUp = () => {
+      setIsDraggingSplit(false);
+    };
+    document.body.style.userSelect = 'none';
+    document.body.style.cursor = 'col-resize';
+    window.addEventListener('mousemove', handleMouseMove);
+    window.addEventListener('mouseup', handleMouseUp);
+    return () => {
+      document.body.style.userSelect = '';
+      document.body.style.cursor = '';
+      window.removeEventListener('mousemove', handleMouseMove);
+      window.removeEventListener('mouseup', handleMouseUp);
+    };
+  }, [isDraggingSplit]);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem('foxy_split_pane_right_pct_v21', String(rightPanePct));
+    } catch {
+      // ignore
+    }
+  }, [rightPanePct]);
+
+  // Lightweight Background Undercut Watchdog (5-minute CCP cache aligned):
+  // Polls ONLY the user's open order type_ids while the tab is hidden (or idle) without waking full market scans.
+  useEffect(() => {
+    if (profile.mode !== 'eve_sso' || !eveAccessToken || !profile.characterId) return;
+
+    const runWatchdog = async () => {
+      const openOrders = profile.activeOrders ?? [];
+      if (openOrders.length === 0) return;
+      try {
+        const res = await pollUndercutWatchdogClient(
+          profile.characterId!,
+          eveAccessToken,
+          getEffectiveOrderFees(profile).salesTaxPct / 100
+        );
+        if (res.cacheMeta) {
+          setCacheTelemetry({
+            ...res.cacheMeta,
+            mode: typeof document !== 'undefined' && document.hidden ? 'background_watchdog' : 'active_sync',
+            watchdogActive: typeof document !== 'undefined' ? document.hidden : false,
+          });
+        }
+        if (Array.isArray(res.orders) && res.orders.length > 0) {
+          setOrderMonitorData((prev) => ({
+            syncedAt: res.syncedAt,
+            orders: res.orders,
+            undercutCount: res.undercutCount,
+            recentTransactions: prev?.recentTransactions ?? [],
+            realizedRevenue24hIsk: prev?.realizedRevenue24hIsk ?? 0,
+            realizedSpend24hIsk: prev?.realizedSpend24hIsk ?? 0,
+            realizedProfit24hIsk: prev?.realizedProfit24hIsk ?? 0,
+            realizedProfit7dIsk: prev?.realizedProfit7dIsk ?? 0,
+            cacheMeta: res.cacheMeta ?? prev?.cacheMeta,
+          }));
+        }
+      } catch {
+        // Watchdog stays non-intrusive on transient errors
+      }
+    };
+
+    const handleVisibilityChange = () => {
+      const hidden = typeof document !== 'undefined' && document.hidden;
+      setCacheTelemetry((prev) =>
+        prev
+          ? {
+              ...prev,
+              mode: hidden ? 'background_watchdog' : 'active_sync',
+              watchdogActive: hidden,
+            }
+          : prev
+      );
+      if (!hidden) {
+        // Tab returned to foreground — allow normal market sync if stale (>5m)
+        const lastMs = snapshotRef.current.lastSyncedAt
+          ? Date.parse(snapshotRef.current.lastSyncedAt)
+          : 0;
+        if (Date.now() - lastMs > 300_000) {
+          void syncLiveMarkets(checkedCategories, false, [sourceHub, destHub]);
+        }
+      }
+    };
+
+    document.addEventListener('visibilitychange', handleVisibilityChange);
+    const interval = window.setInterval(() => {
+      void runWatchdog();
+    }, 300_000);
+
+    return () => {
+      document.removeEventListener('visibilitychange', handleVisibilityChange);
+      window.clearInterval(interval);
+    };
+  }, [
+    checkedCategories,
+    destHub,
+    eveAccessToken,
+    profile,
+    sourceHub,
+    syncLiveMarkets,
+  ]);
 
   // Listen for EVE SSO popup callback postMessage
   useEffect(() => {
@@ -1684,10 +1876,146 @@ export default function App() {
     return list;
   }, [sectionsToRender, visibleCardsByEngine, activeView]);
 
-  // Active queued cards derived strictly from queuedRouteIds + live engineBundle.cards
+  // Map of all live engine cards by ID (used by BuildQueueAndLedgerPanel & Slicer propagation)
+  const cardsById = useMemo(() => {
+    const m = new Map<string, ActionCardData>();
+    for (const c of engineBundle.cards) {
+      m.set(c.id, c);
+    }
+    return m;
+  }, [engineBundle.cards]);
+
+  const activeMfgJobCount = useMemo(
+    () => (profile.industryJobs ?? []).filter((j) => j.status === 'active' && j.activityId === 1).length,
+    [profile.industryJobs]
+  );
+
+  const handleCommitCardQty = useCallback((cardId: string, qty: number) => {
+    const clamped = Math.max(1, Math.round(qty || 1));
+    setQtyOverridesByCardId((prev) => ({ ...prev, [cardId]: clamped }));
+    // Keep Build Queue runs in sync automatically when card slicer changes
+    setBuildQueue((prev) =>
+      prev.some((e) => e.cardId === cardId)
+        ? prev.map((e) => (e.cardId === cardId ? { ...e, committedRuns: clamped } : e))
+        : prev
+    );
+  }, []);
+
+  // Build Queue handlers
+  const handleAddToBuildQueue = useCallback(
+    (card: ActionCardData, runs: number, slots: number) => {
+      const cleanRuns = Math.max(1, Math.round(runs || 1));
+      const cleanSlots = Math.max(1, Math.round(slots || 1));
+      setQtyOverridesByCardId((prev) => ({ ...prev, [card.id]: cleanRuns }));
+      setBuildQueue((prev) => {
+        const exists = prev.find((e) => e.cardId === card.id);
+        if (exists) {
+          return prev.map((e) =>
+            e.cardId === card.id
+              ? { ...e, committedRuns: cleanRuns, allocatedSlots: cleanSlots }
+              : e
+          );
+        }
+        return [
+          ...prev,
+          {
+            cardId: card.id,
+            title: card.title,
+            productTypeId: card.primaryTypeId ?? 0,
+            productName: card.primaryItemName || card.title,
+            committedRuns: cleanRuns,
+            outputPerRun: Math.max(1, card.outputPerRun ?? 1),
+            allocatedSlots: cleanSlots,
+            priorityOrder: prev.length + 1,
+            addedAt: new Date().toISOString(),
+          },
+        ];
+      });
+      setActionToast(`Added ${card.title} (${cleanRuns} runs, ${cleanSlots} slot${cleanSlots > 1 ? 's' : ''}) to Multi-Slot Build Queue.`);
+      window.setTimeout(() => setActionToast(null), 3200);
+    },
+    []
+  );
+
+  const handleUpdateQueueRuns = useCallback((cardId: string, runs: number) => {
+    const clean = Math.max(1, Math.round(runs || 1));
+    setQtyOverridesByCardId((prev) => ({ ...prev, [cardId]: clean }));
+    setBuildQueue((prev) =>
+      prev.map((e) => (e.cardId === cardId ? { ...e, committedRuns: clean } : e))
+    );
+  }, []);
+
+  const handleUpdateQueueSlots = useCallback((cardId: string, slots: number) => {
+    const clean = Math.max(1, Math.round(slots || 1));
+    setBuildQueue((prev) =>
+      prev.map((e) => (e.cardId === cardId ? { ...e, allocatedSlots: clean } : e))
+    );
+  }, []);
+
+  const handleMoveQueuePriority = useCallback((cardId: string, direction: 'up' | 'down') => {
+    setBuildQueue((prev) => {
+      const idx = prev.findIndex((e) => e.cardId === cardId);
+      if (idx < 0) return prev;
+      const target = direction === 'up' ? idx - 1 : idx + 1;
+      if (target < 0 || target >= prev.length) return prev;
+      const copy = [...prev];
+      const [moved] = copy.splice(idx, 1);
+      copy.splice(target, 0, moved);
+      return copy.map((e, i) => ({ ...e, priorityOrder: i + 1 }));
+    });
+  }, []);
+
+  const handleRemoveQueueEntry = useCallback((cardId: string) => {
+    setBuildQueue((prev) =>
+      prev.filter((e) => e.cardId !== cardId).map((e, i) => ({ ...e, priorityOrder: i + 1 }))
+    );
+  }, []);
+
+  const handleClearBuildQueue = useCallback(() => {
+    setBuildQueue([]);
+  }, []);
+
+  // Scale a card's routeChains, volume, capital, and profit when the user edits its Slicer Qty/Runs
+  const applyCommittedQtyToCard = useCallback(
+    (card: ActionCardData): ActionCardData => {
+      const override = qtyOverridesByCardId[card.id];
+      const baseQty = card.baseBatchQty ?? 0;
+      if (!override || baseQty <= 0 || override === baseQty) return card;
+      const ratio = override / baseQty;
+      return {
+        ...card,
+        netProfitIsk: card.netProfitIsk * ratio,
+        requiredCapitalIsk: card.requiredCapitalIsk * ratio,
+        totalVolumeM3: card.totalVolumeM3 * ratio,
+        routeChains: card.routeChains.map((chain) => ({
+          ...chain,
+          legs: chain.legs.map((leg) => ({
+            ...leg,
+            iskCost: typeof leg.iskCost === 'number' ? leg.iskCost * ratio : undefined,
+            iskPayout: typeof leg.iskPayout === 'number' ? leg.iskPayout * ratio : undefined,
+            netProfitIsk:
+              typeof leg.netProfitIsk === 'number' ? leg.netProfitIsk * ratio : undefined,
+            cargoDeltaM3: leg.cargoDeltaM3 * ratio,
+            items: leg.items.map((it) => ({
+              ...it,
+              quantity: Math.max(1, Math.round(it.quantity * ratio)),
+              iskAmount: it.iskAmount * ratio,
+              volumeM3: it.volumeM3 * ratio,
+            })),
+          })),
+        })),
+      };
+    },
+    [qtyOverridesByCardId]
+  );
+
+  // Active queued cards derived strictly from queuedRouteIds + live engineBundle.cards + committed slicer quantities
   const queuedRouteCards = useMemo(
-    () => engineBundle.cards.filter((c) => queuedRouteIds.includes(c.id)),
-    [engineBundle.cards, queuedRouteIds]
+    () =>
+      engineBundle.cards
+        .filter((c) => queuedRouteIds.includes(c.id))
+        .map(applyCommittedQtyToCard),
+    [engineBundle.cards, queuedRouteIds, applyCommittedQtyToCard]
   );
   const queuedProfitSum = useMemo(
     () => queuedRouteCards.reduce((s, c) => s + c.netProfitIsk, 0),
@@ -1769,10 +2097,11 @@ export default function App() {
         }
         onOpenApiSetup={() => openApiSetupModal(null)}
         hasEveClientId={Boolean(effectiveEveClientId)}
+        cacheTelemetry={cacheTelemetry}
       />
 
-      {/* Main Split Command Workspace (Center Workspace + Right Docked AI Sidebar) */}
-      <div className="flex-1 flex flex-col lg:flex-row min-h-0">
+      {/* Main Resizable Split Command Workspace (Center Workspace + Drag Divider + Right Docked Panel) */}
+      <div ref={splitContainerRef} className="flex-1 flex flex-col lg:flex-row min-h-0">
         {/* Main Center Workspace */}
         <main className="flex-1 min-w-0 lg:overflow-y-auto px-5 py-5 space-y-5">
           {/* Compact Pilot & Data Freshness Context Ribbon */}
@@ -2207,6 +2536,25 @@ export default function App() {
                 />
               )}
 
+              {(activeView === 'overview' || activeView === 'indy_invention') && (
+                <BuildQueueAndLedgerPanel
+                  entries={buildQueue}
+                  cardsById={cardsById}
+                  profile={profile}
+                  snapshot={snapshot}
+                  structureConfig={structureConfig}
+                  activeMfgJobCount={activeMfgJobCount}
+                  selectedEntryId={selectedCardId}
+                  onSelectEntry={setSelectedCardId}
+                  onUpdateRuns={handleUpdateQueueRuns}
+                  onUpdateSlots={handleUpdateQueueSlots}
+                  onMovePriority={handleMoveQueuePriority}
+                  onRemoveEntry={handleRemoveQueueEntry}
+                  onClearQueue={handleClearBuildQueue}
+                  onOpenHaulerFlyout={setHaulerFlyoutContext}
+                />
+              )}
+
               {(activeView === 'overview' ||
                 activeView === 'corridor_trade' ||
                 activeView === 'regional_trade') && (
@@ -2221,6 +2569,7 @@ export default function App() {
                   onUpdateWatchlistItem={handleUpdateWatchlistItem}
                   onRemoveWatchlistItem={handleRemoveWatchlistItem}
                   onOpenHistory={handleOpenHistory}
+                  onOpenPriceProjection={setPriceProjectionTarget}
                 />
               )}
 
@@ -2310,6 +2659,17 @@ export default function App() {
                                 ? pinnedTypeIds.has(card.primaryTypeId)
                                 : false
                             }
+                            committedQty={qtyOverridesByCardId[card.id]}
+                            onCommitQty={handleCommitCardQty}
+                            isSelected={selectedCardId === card.id}
+                            onSelectCard={setSelectedCardId}
+                            snapshot={snapshot}
+                            structureConfig={structureConfig}
+                            activeMfgJobCount={activeMfgJobCount}
+                            isInBuildQueue={buildQueue.some((e) => e.cardId === card.id)}
+                            onAddToBuildQueue={handleAddToBuildQueue}
+                            onOpenHaulerFlyout={setHaulerFlyoutContext}
+                            onOpenPriceProjection={setPriceProjectionTarget}
                             onToggleQueueForRoute={handleToggleQueueCard}
                             onTogglePinWatchlist={handleTogglePinWatchlist}
                             onChangeExecutionMode={handleChangeExecutionMode}
@@ -2350,38 +2710,39 @@ export default function App() {
           )}
         </main>
 
+        {/* Click-and-Drag Resizable Vertical Split-Pane Divider (Desktop Only; double-click resets 50/50) */}
+        {rightSidebarMode !== 'collapsed' && (
+          <div
+            role="separator"
+            aria-orientation="vertical"
+            aria-label="Resize workspace and right sidebar (double-click to reset 50/50)"
+            title="Drag to resize · Double-click to reset 50/50"
+            onMouseDown={(e) => {
+              e.preventDefault();
+              setIsDraggingSplit(true);
+            }}
+            onDoubleClick={() => setRightPanePct(50)}
+            className={`hidden lg:flex w-2 shrink-0 cursor-col-resize items-center justify-center border-l border-slate-800/90 transition-colors group ${
+              isDraggingSplit
+                ? 'bg-cyan-500/25 border-cyan-400/70'
+                : 'bg-[#0b0e14] hover:bg-cyan-500/15 hover:border-cyan-400/50'
+            }`}
+          >
+            <div
+              className={`w-1 h-10 rounded-full transition-colors ${
+                isDraggingSplit
+                  ? 'bg-cyan-300'
+                  : 'bg-slate-700 group-hover:bg-cyan-400'
+              }`}
+            />
+          </div>
+        )}
+
         {/* Collapsible Right Docked Panel: Fleet Logistics & Autopilot OR Gemini Strategic Advisor */}
-        {rightSidebarMode === 'route' ? (
-          <RouteOptimizerSidebar
-            queuedCards={queuedRouteCards}
-            allCandidateCards={visibleCardsList}
-            pilotSystemId={profile.currentSystemId}
-            pilotSystemName={profile.currentSystemName}
-            pilotStationId={profile.currentStationId}
-            pilotStationName={profile.currentStationName}
-            pilotMode={profile.mode}
-            eveAccessToken={eveAccessToken}
-            walletBalance={profile.walletBalance}
-            activeSellOrderCount={activeSellOrderCount}
-            isRefreshingWalletOrders={isRefreshingWalletOrders}
-            onRefreshWalletOrders={handleRefreshWalletOrders}
-            hulls={profile.hulls}
-            onRemoveCard={handleRemoveQueuedCard}
-            onClearQueue={handleClearRouteQueue}
-            onSelectAllVisible={handleSelectAllVisible}
-            onApplyAutoFilledRoute={handleApplyAutoFilledRoute}
-            onSwitchToAdvisor={() => setRightSidebarMode('advisor')}
-            onOpenSsoSettings={() => openSettingsTab('sso')}
-            onCollapse={() => setRightSidebarMode('collapsed')}
-          />
-        ) : (
+        {rightSidebarMode === 'collapsed' ? (
           <AdvisorSidebar
-            isCollapsed={rightSidebarMode === 'collapsed'}
-            onToggleCollapse={() =>
-              setRightSidebarMode((mode) =>
-                mode === 'collapsed' ? 'advisor' : 'collapsed'
-              )
-            }
+            isCollapsed
+            onToggleCollapse={() => setRightSidebarMode('advisor')}
             queuedRouteCount={queuedRouteCards.length}
             onSwitchToRoute={() => setRightSidebarMode('route')}
             messages={messages}
@@ -2397,6 +2758,55 @@ export default function App() {
             activeCategoryCount={checkedCategories.length}
             activeTabLabel={activeTabLabel}
           />
+        ) : (
+          <div
+            className="w-full lg:h-full shrink-0 lg:min-w-[330px] lg:max-w-[66%] flex flex-col"
+            style={{ flexBasis: `${rightPanePct}%` }}
+          >
+            {rightSidebarMode === 'route' ? (
+              <RouteOptimizerSidebar
+                queuedCards={queuedRouteCards}
+                allCandidateCards={visibleCardsList}
+                pilotSystemId={profile.currentSystemId}
+                pilotSystemName={profile.currentSystemName}
+                pilotStationId={profile.currentStationId}
+                pilotStationName={profile.currentStationName}
+                pilotMode={profile.mode}
+                eveAccessToken={eveAccessToken}
+                walletBalance={profile.walletBalance}
+                activeSellOrderCount={activeSellOrderCount}
+                isRefreshingWalletOrders={isRefreshingWalletOrders}
+                onRefreshWalletOrders={handleRefreshWalletOrders}
+                hulls={profile.hulls}
+                onRemoveCard={handleRemoveQueuedCard}
+                onClearQueue={handleClearRouteQueue}
+                onSelectAllVisible={handleSelectAllVisible}
+                onApplyAutoFilledRoute={handleApplyAutoFilledRoute}
+                onSwitchToAdvisor={() => setRightSidebarMode('advisor')}
+                onOpenSsoSettings={() => openSettingsTab('sso')}
+                onCollapse={() => setRightSidebarMode('collapsed')}
+              />
+            ) : (
+              <AdvisorSidebar
+                isCollapsed={false}
+                onToggleCollapse={() => setRightSidebarMode('collapsed')}
+                queuedRouteCount={queuedRouteCards.length}
+                onSwitchToRoute={() => setRightSidebarMode('route')}
+                messages={messages}
+                isLoading={isAdvisorLoading}
+                onSendMessage={handleSendAdvisorMessage}
+                onResetChat={() => {
+                  setMessages([createWelcomeMessage(profile)]);
+                  setAppliedActionIds([]);
+                }}
+                onExecuteAction={handleExecuteAdvisorAction}
+                appliedActionIds={appliedActionIds}
+                currentSystemName={profile.currentSystemName}
+                activeCategoryCount={checkedCategories.length}
+                activeTabLabel={activeTabLabel}
+              />
+            )}
+          </div>
         )}
       </div>
 
@@ -2461,6 +2871,7 @@ export default function App() {
         snapshot={snapshot}
         minDailyVolume={minDailyVolume}
         onOpenHistory={handleOpenHistory}
+        onOpenPriceProjection={setPriceProjectionTarget}
         onClose={() => setInspectedSkuCategory(null)}
       />
 
@@ -2468,6 +2879,25 @@ export default function App() {
       <MarketHistoryModal
         target={historyTarget}
         onClose={() => setHistoryTarget(null)}
+      />
+
+      {/* Quantitative 7d/30d Price Projection & Optional BYOK AI Commentary Modal */}
+      <PriceProjectionModal
+        target={priceProjectionTarget}
+        aiSettings={aiSettings}
+        onOpenSettings={() => {
+          setPriceProjectionTarget(null);
+          openSettingsTab('profile');
+        }}
+        onClose={() => setPriceProjectionTarget(null)}
+      />
+
+      {/* Slide-Over Hauling Route Planner, Smart Hull Suggester & Multi-Buy Fit Flyout */}
+      <HaulerFitFlyout
+        context={haulerFlyoutContext}
+        profile={profile}
+        snapshot={snapshot}
+        onClose={() => setHaulerFlyoutContext(null)}
       />
 
       {/* Subtle Bottom Footer Bar with Semantic Version Pill */}
@@ -2532,6 +2962,8 @@ export default function App() {
         onToggleCorpBlueprints={handleToggleCorpBlueprints}
         onRescanBlueprints={() => handleScanBlueprints(includeCorpBlueprints)}
         onOpenHistory={handleOpenHistory}
+        aiSettings={aiSettings}
+        onChangeAiSettings={handleChangeAiSettings}
       />
     </div>
   );

@@ -60,3 +60,47 @@ export function saveCustomGeminiKey(value: string): void {
     // Ignore storage quota or private-mode restrictions
   }
 }
+
+export const AI_COMMENTARY_ENABLED_KEY = 'foxy_ai_commentary_enabled_v21';
+export const AI_COMMENTARY_PROVIDER_KEY = 'foxy_ai_commentary_provider_v21';
+export const CUSTOM_OPENAI_KEY_KEY = 'foxy_custom_openai_key_v21';
+
+export function loadAiCommentarySettings(): {
+  enabled: boolean;
+  provider: 'gemini' | 'openai';
+  geminiKey: string;
+  openaiKey: string;
+} {
+  try {
+    const enabled = localStorage.getItem(AI_COMMENTARY_ENABLED_KEY) === 'true';
+    const rawProv = localStorage.getItem(AI_COMMENTARY_PROVIDER_KEY);
+    const provider: 'gemini' | 'openai' = rawProv === 'openai' ? 'openai' : 'gemini';
+    const geminiKey = loadCustomGeminiKey();
+    const openaiKey = (localStorage.getItem(CUSTOM_OPENAI_KEY_KEY) || '').trim();
+    return { enabled, provider, geminiKey, openaiKey };
+  } catch {
+    return { enabled: false, provider: 'gemini', geminiKey: '', openaiKey: '' };
+  }
+}
+
+export function saveAiCommentarySettings(settings: {
+  enabled: boolean;
+  provider: 'gemini' | 'openai';
+  geminiKey: string;
+  openaiKey: string;
+}): void {
+  try {
+    localStorage.setItem(AI_COMMENTARY_ENABLED_KEY, String(settings.enabled));
+    localStorage.setItem(AI_COMMENTARY_PROVIDER_KEY, settings.provider);
+    saveCustomGeminiKey(settings.geminiKey);
+    const trimmedOpenAi = settings.openaiKey.trim();
+    if (trimmedOpenAi) {
+      localStorage.setItem(CUSTOM_OPENAI_KEY_KEY, trimmedOpenAi);
+    } else {
+      localStorage.removeItem(CUSTOM_OPENAI_KEY_KEY);
+    }
+  } catch {
+    // Ignore storage quota or private-mode restrictions
+  }
+}
+
