@@ -1,32 +1,37 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import {
   AlertTriangle,
-  ArrowDown,
-  ArrowUp,
   Check,
   CheckCircle2,
+  Compass,
   Copy,
   ExternalLink,
   RefreshCw,
 } from 'lucide-react';
 import { EVE_ANCHORS } from '../data/eveCatalog.ts';
 import { formatIsk } from '../engines/decisionEngines.ts';
+import { getDotlanSystemUrl } from '../utils/dotlan.ts';
 import {
   computeEve4SigFigTick,
   computeRelistFeePreview,
 } from '../utils/eveMarketMath.ts';
 import { copyTextToClipboard } from '../utils/eveMultibuy.ts';
+import { deriveQuickMultiPeriodTrend } from '../utils/v22Engines.ts';
 import type {
   ActionCardData,
+  AppSettingsV22,
   LiveOrderBookEntry,
   LiveOrderBookResponse,
   PilotProfile,
 } from '../types/eve.ts';
+import { InfoTip } from './InfoTip.tsx';
+import { PriceTrendRibbon } from './PriceTrendRibbon.tsx';
 
 interface LiveOrderBookPanelProps {
   card: ActionCardData;
   profile: PilotProfile;
   eveAccessToken: string | null;
+  appSettings?: AppSettingsV22;
   onOpenSsoSettings: () => void;
 }
 
@@ -186,6 +191,7 @@ export function LiveOrderBookPanel({
   card,
   profile,
   eveAccessToken,
+  appSettings,
   onOpenSsoSettings,
 }: LiveOrderBookPanelProps) {
   // Derive inspectable item targets from the card's routeChains & primaryTypeId
@@ -413,17 +419,24 @@ export function LiveOrderBookPanel({
   const yesterdayAvg = data?.yesterdayAvgPrice ?? 0;
   const prevSessionSell = data?.prevSessionSellMin ?? 0;
 
-  // Dual Trend Arrows (Market Depth view ONLY):
-  // 1) Large bold saturated arrow (#10B981 / #EF4444) for 24h trend vs yesterday's ESI daily average
-  // 2) Smaller soft pastel arrow (#86EFAC / #FCA5A5) for recent session tick since last 5-min refresh
-  const delta24hPct =
-    topSellPrice > 0 && yesterdayAvg > 0
-      ? ((topSellPrice - yesterdayAvg) / yesterdayAvg) * 100
-      : null;
-  const deltaSessionPct =
-    topSellPrice > 0 && prevSessionSell > 0
-      ? ((topSellPrice - prevSessionSell) / prevSessionSell) * 100
-      : null;
+  const trendData = useMemo(() => {
+    if (topSellPrice > 0) {
+      const refPrice = yesterdayAvg > 0 ? yesterdayAvg : prevSessionSell > 0 ? prevSessionSell : topSellPrice;
+      return deriveQuickMultiPeriodTrend(
+        activeTarget.typeId,
+        {
+          sellMin: topSellPrice,
+          sellPercentile: refPrice,
+          sellVolume: 100,
+          buyMax: data?.topBuyOrdersAtSellHub?.[0]?.price ?? topSellPrice * 0.94,
+          buyPercentile: refPrice * 0.94,
+          buyVolume: 100,
+        },
+        refPrice
+      );
+    }
+    return card.multiPeriodTrend ?? null;
+  }, [topSellPrice, yesterdayAvg, prevSessionSell, activeTarget.typeId, card.multiPeriodTrend, data?.topBuyOrdersAtSellHub]);
 
   const handleCopyTickPrice = async (
     orderId: number,
@@ -439,60 +452,37 @@ export function LiveOrderBookPanel({
 
   return (
     <div className="border-t border-slate-800/90 bg-[#0b0f17] px-5 py-4 space-y-3.5">
-      {/* Header + Dual Trend Arrows (Market Depth ONLY) + Refresh */}
+      {/* Header + Multi-Period Trend Ribbon + DOTLAN + Refresh */}
       <div className="flex flex-wrap items-center justify-between gap-2">
         <div className="flex flex-wrap items-center gap-2.5 min-w-0">
           <span className="text-xs font-semibold text-slate-100">
-            Live ESI Market Depth &amp; Remote Buy Range
+            Live ESI Market Depth &amp; Remote Range
           </span>
           <span className="text-[11px] font-mono text-slate-400">
-            · {activeTarget.name} (ID {activeTarget.typeId})
+            · {activeTarget.name} (#{activeTarget.typeId})
           </span>
           {topSellPrice > 0 && (
-            <span className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded-md bg-slate-900 border border-slate-800 font-mono text-xs text-slate-100">
-              <span>{formatIsk(topSellPrice, false)}</span>
-              {/* Dual Trend Arrows: Large Saturated 24h Arrow + Small Pastel Session Tick Arrow */}
-              <span
-                className="inline-flex items-center gap-0.5"
-                title={`24h vs yesterday avg (${yesterdayAvg > 0 ? formatIsk(yesterdayAvg, false) : 'n/a'}): ${
-                  delta24hPct !== null ? `${delta24hPct >= 0 ? '+' : ''}${delta24hPct.toFixed(2)}%` : 'flat'
-                } | Recent 5m tick: ${
-                  deltaSessionPct !== null ? `${deltaSessionPct >= 0 ? '+' : ''}${deltaSessionPct.toFixed(2)}%` : 'unchanged'
-                }`}
-              >
-                {delta24hPct !== null ? (
-                  delta24hPct >= 0 ? (
-                    <ArrowUp className="w-4 h-4 stroke-[3]" style={{ color: '#10B981' }} aria-label="24h trend up" />
-                  ) : (
-                    <ArrowDown className="w-4 h-4 stroke-[3]" style={{ color: '#EF4444' }} aria-label="24h trend down" />
-                  )
-                ) : (
-                  <ArrowUp className="w-4 h-4 stroke-[2.5] opacity-40" style={{ color: '#10B981' }} aria-hidden="true" />
-                )}
-                {deltaSessionPct !== null ? (
-                  deltaSessionPct >= 0 ? (
-                    <ArrowUp className="w-3 h-3 stroke-[2.2]" style={{ color: '#86EFAC' }} aria-label="Session tick up" />
-                  ) : (
-                    <ArrowDown className="w-3 h-3 stroke-[2.2]" style={{ color: '#FCA5A5' }} aria-label="Session tick down" />
-                  )
-                ) : (
-                  <ArrowUp className="w-3 h-3 stroke-[2] opacity-45" style={{ color: '#86EFAC' }} aria-hidden="true" />
-                )}
-              </span>
-              {delta24hPct !== null && (
-                <span
-                  className="text-[10px] font-semibold"
-                  style={{ color: delta24hPct >= 0 ? '#10B981' : '#EF4444' }}
-                >
-                  {delta24hPct >= 0 ? '+' : ''}
-                  {delta24hPct.toFixed(1)}% 24h
-                </span>
-              )}
+            <span className="font-mono text-xs text-slate-100 bg-slate-900 border border-slate-800 px-2 py-0.5 rounded">
+              {formatIsk(topSellPrice, false)}
             </span>
           )}
-          <span className="text-[10px] font-mono text-slate-500">
-            · Marketing Lvl {ROMAN[Math.max(0, Math.min(5, Math.floor(marketingLevel)))]}
-          </span>
+          {trendData && (
+            <PriceTrendRibbon
+              trend={trendData}
+              primaryPeriod={appSettings?.priceTrendPeriod ?? '7d'}
+              showSparkline={true}
+              tooltipsEnabled={appSettings?.tooltipsEnabled ?? true}
+            />
+          )}
+          <a
+            href={getDotlanSystemUrl(activeTarget.buySystemName)}
+            target="_blank"
+            rel="noopener noreferrer"
+            className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded border border-slate-800 bg-[#131822] text-[10px] text-slate-300 hover:border-cyan-400/50 hover:text-cyan-200"
+          >
+            <Compass className="w-2.5 h-2.5 text-cyan-400" />
+            <span>DOTLAN ({activeTarget.buySystemName})</span>
+          </a>
         </div>
 
         <button
@@ -529,35 +519,42 @@ export function LiveOrderBookPanel({
         </div>
       )}
 
-      {/* Skill-Based Remote Buy Range Status Banner + Open Market in EVE Button */}
+      {/* Concise Remote Buy Range Strip + Locked InfoTip Advisory + Open Market in EVE */}
       <div
-        className={`px-3.5 py-2.5 rounded-lg border flex flex-wrap items-center justify-between gap-2.5 text-xs ${
+        className={`px-3 py-2 rounded-lg border flex flex-wrap items-center justify-between gap-2 text-xs ${
           remoteRange.inRange
-            ? 'border-emerald-500/45 bg-emerald-500/10 text-emerald-200'
-            : 'border-amber-500/45 bg-amber-500/10 text-amber-200'
+            ? 'border-emerald-500/40 bg-emerald-500/10 text-emerald-200'
+            : 'border-amber-500/40 bg-amber-500/10 text-amber-200'
         }`}
       >
-        <div className="flex items-start gap-2 min-w-0 flex-1">
+        <div className="flex items-center gap-2 min-w-0 flex-1">
           {remoteRange.inRange ? (
-            <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0 mt-0.5" aria-hidden="true" />
+            <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0" aria-hidden="true" />
           ) : (
-            <AlertTriangle className="w-4 h-4 text-amber-400 shrink-0 mt-0.5" aria-hidden="true" />
+            <AlertTriangle className="w-4 h-4 text-amber-400 shrink-0" aria-hidden="true" />
           )}
-          <div className="space-y-0.5 min-w-0">
-            <div className="font-semibold leading-snug">{remoteRange.summary}</div>
-            <div className="text-[11px] opacity-85 font-mono">
-              Pilot: {profile.currentSystemName} → Buy Hub: {activeTarget.buySystemName} (
-              {remoteRange.jumps}j) · Procurement Lvl {remoteRange.levelLabel} (ID 16596) ·
-              Marketing Lvl {ROMAN[Math.max(0, Math.min(5, Math.floor(marketingLevel)))]} (ID 16598)
-            </div>
-          </div>
+          <span className="font-medium truncate">
+            {remoteRange.inRange
+              ? `In Remote Buy Range (${remoteRange.jumps}j · Procurement ${remoteRange.levelLabel})`
+              : `Out of Remote Range (${remoteRange.jumps}j · Needs ${
+                  remoteRange.crossRegion
+                    ? 'Same Region'
+                    : `Procurement ${remoteRange.requiredLevelLabel}`
+                })`}
+          </span>
+          <InfoTip
+            locked
+            tooltipsEnabled={appSettings?.tooltipsEnabled ?? true}
+            title="Remote Order Range Rules (Procurement & Marketing)"
+            content={`${remoteRange.summary}. Pilot: ${profile.currentSystemName} -> Buy Hub: ${activeTarget.buySystemName} (${remoteRange.jumps}j). Procurement (ID 16596) Lvl ${remoteRange.levelLabel}: 0=Station, I=System, II=5j, III=10j, IV=20j, V=Region. Marketing (ID 16598) Lvl ${ROMAN[Math.max(0, Math.min(5, Math.floor(marketingLevel)))]} controls remote Sell Orders.`}
+          />
         </div>
 
         <button
           type="button"
           onClick={handleOpenMarketInEve}
           disabled={openingMarket}
-          title={`Open ${activeTarget.name} Market Details in EVE Online (POST /ui/openwindow/marketdetails/?type_id=${activeTarget.typeId})`}
+          title={`Open ${activeTarget.name} Market Details in EVE Online`}
           className={`inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold rounded border transition-colors whitespace-nowrap shrink-0 cursor-pointer disabled:opacity-50 ${
             remoteRange.inRange
               ? 'border-emerald-400/60 bg-emerald-500/20 text-emerald-100 hover:bg-emerald-500/30'

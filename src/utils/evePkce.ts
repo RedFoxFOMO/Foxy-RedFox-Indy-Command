@@ -12,6 +12,7 @@ export const EVE_SSO_SCOPES = [
   'esi-assets.read_assets.v1',
   'esi-ui.write_waypoint.v1',
   'esi-ui.open_window.v1',
+  'esi-characters.read_standings.v1',
 ];
 
 function base64UrlEncode(bytes: Uint8Array): string {

@@ -48,3 +48,59 @@
 ::-webkit-scrollbar-thumb:hover {
   background: #334155;
 }
+
+/* Clean Route Manifest & Visual Map PDF Print Stylesheet */
+@media print {
+  @page {
+    margin: 12mm;
+    size: auto;
+  }
+
+  html,
+  body,
+  #root {
+    height: auto !important;
+    overflow: visible !important;
+    background: #ffffff !important;
+    color: #0f172a !important;
+  }
+
+  .no-print {
+    display: none !important;
+  }
+
+  .print-route-area {
+    display: block !important;
+    position: static !important;
+    width: 100% !important;
+    height: auto !important;
+    max-height: none !important;
+    overflow: visible !important;
+    background: #ffffff !important;
+    color: #0f172a !important;
+    border: none !important;
+    box-shadow: none !important;
+  }
+
+  .print-route-area * {
+    color: #0f172a !important;
+    border-color: #cbd5e1 !important;
+    box-shadow: none !important;
+  }
+
+  .print-route-area svg {
+    background: #0f172a !important;
+    -webkit-print-color-adjust: exact !important;
+    print-color-adjust: exact !important;
+    page-break-inside: avoid;
+  }
+
+  .print-route-area .print-gank-alert {
+    background: #fee2e2 !important;
+    border: 1px solid #dc2626 !important;
+    color: #991b1b !important;
+    -webkit-print-color-adjust: exact !important;
+    print-color-adjust: exact !important;
+  }
+}
+

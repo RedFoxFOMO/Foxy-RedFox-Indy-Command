@@ -112,6 +112,8 @@ export const EMPIRE_HUBS: EmpireHubDef[] = [
   },
 ];
 
+export const EMPIRE_HUB_LIST: EmpireHubDef[] = EMPIRE_HUBS;
+
 export const EMPIRE_HUB_MAP: Record<TradeHubId, EmpireHubDef> = Object.fromEntries(
   EMPIRE_HUBS.map((h) => [h.id, h])
 ) as Record<TradeHubId, EmpireHubDef>;

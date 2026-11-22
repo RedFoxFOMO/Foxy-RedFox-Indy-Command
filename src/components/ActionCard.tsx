@@ -8,6 +8,7 @@ import {
   ChevronDown,
   ChevronUp,
   Clock,
+  Compass,
   Layers,
   LineChart,
   MessageSquareText,
@@ -19,7 +20,7 @@ import {
   Table2,
   Truck,
 } from 'lucide-react';
-import { EVE_ANCHORS, ITEM_BY_ID } from '../data/eveCatalog.ts';
+import { EMPIRE_HUB_MAP, EVE_ANCHORS, ITEM_BY_ID } from '../data/eveCatalog.ts';
 import {
   formatIsk,
   formatM3,
@@ -29,6 +30,7 @@ import {
   getQuote,
   getSalesTaxRate,
 } from '../engines/decisionEngines.ts';
+import { getDotlanRouteUrl, getDotlanSystemUrl } from '../utils/dotlan.ts';
 import {
   computeBlueprintBuildTime,
   formatDurationCompact,
@@ -38,6 +40,7 @@ import {
 } from '../utils/eveMarketMath.ts';
 import type {
   ActionCardData,
+  AppSettingsV22,
   IndustryStructureConfig,
   MarketSnapshot,
   OrderExecutionMode,
@@ -45,17 +48,26 @@ import type {
 } from '../types/eve.ts';
 import { useCollapsibleCard } from '../utils/collapseStore.ts';
 import type { HaulerFlyoutContext } from './HaulerFitFlyout.tsx';
+import { InfoTip } from './InfoTip.tsx';
 import { LiveOrderBookPanel } from './LiveOrderBookPanel.tsx';
+import { PriceTrendRibbon } from './PriceTrendRibbon.tsx';
 
 interface ActionCardProps {
   card: ActionCardData;
   rank: number;
   profile: PilotProfile;
   eveAccessToken: string | null;
+  appSettings?: AppSettingsV22;
   isQueuedForRoute: boolean;
   isPinnedToWatchlist?: boolean;
   committedQty?: number;
   onCommitQty?: (cardId: string, qty: number) => void;
+  cardExecutionModeOverride?: OrderExecutionMode;
+  onChangeCardExecutionMode?: (cardId: string, mode: OrderExecutionMode) => void;
+  cardTransportCostIsk?: number;
+  cardMinDesiredProfitIsk?: number;
+  haulCostOverrideIsk?: number | null;
+  onChangeCardTransport?: (cardId: string, transportIsk: number, minDesiredProfitIsk: number) => void;
   isSelected?: boolean;
   onSelectCard?: (cardId: string) => void;
   snapshot?: MarketSnapshot;
@@ -108,10 +120,17 @@ export function ActionCard({
   rank,
   profile,
   eveAccessToken,
+  appSettings,
   isQueuedForRoute,
   isPinnedToWatchlist = false,
   committedQty,
   onCommitQty,
+  cardExecutionModeOverride,
+  onChangeCardExecutionMode,
+  cardTransportCostIsk = 0,
+  cardMinDesiredProfitIsk = 0,
+  haulCostOverrideIsk = null,
+  onChangeCardTransport,
   isSelected = false,
   onSelectCard,
   snapshot,
@@ -132,12 +151,19 @@ export function ActionCard({
   const [cardCollapsed, toggleCardCollapsed] = useCollapsibleCard(`card-${card.id}`, false);
   const [orderBookExpanded, setOrderBookExpanded] = useState(false);
   const [allocatedSlots, setAllocatedSlots] = useState<number>(1);
+  const [showTransportTools, setShowTransportTools] = useState(false);
 
-  const baseQty = Math.max(1, Math.round(card.baseBatchQty ?? 1));
+  const effectiveExecMode: OrderExecutionMode = cardExecutionModeOverride ?? card.executionMode;
+  const effectiveTransportCostIsk =
+    typeof haulCostOverrideIsk === 'number' && haulCostOverrideIsk >= 0
+      ? haulCostOverrideIsk
+      : Math.max(0, cardTransportCostIsk);
+
+  const baseQty = Math.max(1, Math.round(card.baseBatchQty ?? card.outputUnits ?? 1));
   const optimalQty = Math.max(1, Math.round(card.optimalProfitableQty ?? baseQty));
   const activeQty = Math.max(1, Math.round(committedQty ?? baseQty));
   const isIndyCard = card.engine === 'indy_invention';
-  const showSlicer = Boolean(card.isEditableQty || card.baseBatchQty);
+  const showSlicer = true;
 
   const slotInfo = useMemo(() => {
     const info = getMaxIndustrySlots(profile);
@@ -146,11 +172,15 @@ export function ActionCard({
     return { ...info, mfgActive: active, mfgAvailable: avail };
   }, [profile, activeMfgJobCount]);
 
-  // Live client-side recalculation (0 ESI re-fetches) for slicer Qty/Runs & Slot Allocation
+  // Live client-side recalculation (0 ESI re-fetches) for slicer Qty/Runs, card-specific execution mode & standing broker fees
   const liveMetrics = useMemo(() => {
     const ratio = baseQty > 0 ? activeQty / baseQty : 1;
     const salesTax = getSalesTaxRate(profile.skills.accounting);
-    const brokerFee = getBrokerFeeRate(profile.skills.brokerRelations, card.executionMode);
+    const brokerFee = getBrokerFeeRate(profile.skills.brokerRelations, effectiveExecMode, {
+      hubId: card.destHubId ?? 'jita',
+      standings: profile.npcStandings,
+      appSettings,
+    });
     const netSaleMult = Math.max(0.05, 1 - salesTax - brokerFee);
 
     // 1. Blueprint / Indy card recalculation (BOM orderbook depth-walk + Dual Profit + Concurrency time)
@@ -214,7 +244,7 @@ export function ActionCard({
       let sellShortfallQty = 0;
 
       if (sellHub && (sellHub.sellMin > 0 || sellHub.buyMax > 0)) {
-        if (card.executionMode === 'instant_fill') {
+        if (effectiveExecMode === 'instant_fill') {
           const sellWalk = walkBuyOrderbookForSell(sellHub, totalOutputUnits);
           grossRevenueIsk =
             sellWalk.filledQty > 0
@@ -300,7 +330,7 @@ export function ActionCard({
         let sellSlippage = 0;
         let sellShortfall = 0;
 
-        if (card.executionMode === 'instant_fill') {
+        if (effectiveExecMode === 'instant_fill') {
           const sellWalk = walkBuyOrderbookForSell(sellHub, activeQty);
           grossRevIsk = sellWalk.filledQty > 0 ? sellWalk.totalIsk : activeQty * sellHub.buyMax;
           sellSlippage = sellWalk.slippagePct;
@@ -372,12 +402,33 @@ export function ActionCard({
     isIndyCard,
     snapshot,
     profile,
+    appSettings,
+    effectiveExecMode,
     structureConfig,
     allocatedSlots,
     slotInfo.mfgSlotsMax,
   ]);
 
-  const isPositive = liveMetrics.netProfitIsk >= 0;
+  const netProfitAfterTransport = liveMetrics.netProfitIsk - effectiveTransportCostIsk;
+  const maxAbsorbedTransportIsk = Math.max(0, liveMetrics.netProfitIsk - Math.max(0, cardMinDesiredProfitIsk));
+  const isPositive = netProfitAfterTransport >= 0;
+
+  const dotlanUrl = useMemo(() => {
+    const srcName = card.sourceHubId ? EMPIRE_HUB_MAP[card.sourceHubId]?.systemName : card.routeChains?.[0]?.legs[0]?.systemName;
+    const dstName = card.destHubId ? EMPIRE_HUB_MAP[card.destHubId]?.systemName : card.routeChains?.[0]?.legs[card.routeChains[0].legs.length - 1]?.systemName;
+    if (srcName && dstName && srcName !== dstName) return getDotlanRouteUrl(srcName, dstName);
+    return getDotlanSystemUrl(dstName || srcName || 'Jita');
+  }, [card.sourceHubId, card.destHubId, card.routeChains]);
+
+  const activeBrokerPct = Number(
+    (
+      getBrokerFeeRate(profile.skills.brokerRelations, effectiveExecMode, {
+        hubId: card.destHubId ?? 'jita',
+        standings: profile.npcStandings,
+        appSettings,
+      }) * 100
+    ).toFixed(2)
+  );
   const conflicts = card.activeOrderConflicts ?? [];
   const hasConflict = conflicts.length > 0;
   const conflictTooltip = hasConflict
@@ -515,7 +566,28 @@ export function ActionCard({
             {card.title}
           </h3>
           {!cardCollapsed && (
-            <p className="text-xs text-slate-400 mt-1">{card.subtitle}</p>
+            <div className="mt-1 flex flex-wrap items-center gap-2">
+              <p className="text-xs text-slate-400">{card.subtitle}</p>
+              {card.multiPeriodTrend && (
+                <PriceTrendRibbon
+                  trend={card.multiPeriodTrend}
+                  primaryPeriod={appSettings?.priceTrendPeriod ?? '7d'}
+                  showSparkline={true}
+                  tooltipsEnabled={appSettings?.tooltipsEnabled ?? true}
+                />
+              )}
+              <a
+                href={dotlanUrl}
+                target="_blank"
+                rel="noopener noreferrer"
+                onClick={(e) => e.stopPropagation()}
+                title="Open hub / route in DOTLAN EveMaps"
+                className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded border border-slate-800 bg-[#0b0e14] text-[10px] text-slate-300 hover:border-cyan-400/50 hover:text-cyan-200"
+              >
+                <Compass className="w-2.5 h-2.5 text-cyan-400" />
+                <span>DOTLAN</span>
+              </a>
+            </div>
           )}
         </div>
 
@@ -523,7 +595,11 @@ export function ActionCard({
         <div className="flex items-start justify-between sm:justify-end gap-3 shrink-0">
           <div className="sm:text-right">
             <div className="text-[11px] text-slate-400">
-              {isIndyCard ? 'Buy All (Replacement Cost)' : 'True After-Tax Net Profit'}
+              {effectiveTransportCostIsk > 0
+                ? 'After-Tax & Transport Net'
+                : isIndyCard
+                  ? 'Buy All (Replacement Cost)'
+                  : 'True After-Tax Net Profit'}
             </div>
             <div
               className={`font-mono tabular-nums text-xl font-semibold mt-0.5 ${
@@ -531,7 +607,7 @@ export function ActionCard({
               }`}
             >
               {isPositive ? '+' : ''}
-              {formatIsk(liveMetrics.netProfitIsk)}
+              {formatIsk(netProfitAfterTransport)}
             </div>
             <div
               className={`font-mono tabular-nums text-xs mt-0.5 ${
@@ -546,12 +622,21 @@ export function ActionCard({
               )}
             </div>
             {!cardCollapsed && (
-              <div className="font-mono tabular-nums text-[10px] text-slate-400 mt-0.5">
-                Tax {card.salesTaxPct.toFixed(2)}%
-                {card.brokerFeePct > 0
-                  ? ` + Broker ${card.brokerFeePct.toFixed(2)}%`
-                  : ' · 0% Broker'}
-                {' · '}
+              <div className="font-mono tabular-nums text-[10px] text-slate-400 mt-0.5 inline-flex items-center gap-1 flex-wrap justify-end">
+                <span>
+                  Tax {card.salesTaxPct.toFixed(2)}%
+                  {activeBrokerPct > 0
+                    ? ` + Broker ${activeBrokerPct.toFixed(2)}%`
+                    : ' · 0% Broker'}
+                </span>
+                {card.standingBrokerNote && (
+                  <InfoTip
+                    tooltipsEnabled={appSettings?.tooltipsEnabled ?? true}
+                    title="Exact Broker Fee Breakdown"
+                    content={card.standingBrokerNote}
+                  />
+                )}
+                <span>·</span>
                 <span className="text-amber-300/90">
                   {liveMetrics.perUnitNetProfitIsk >= 0 ? '+' : ''}
                   {Math.abs(liveMetrics.perUnitNetProfitIsk) < 100
@@ -723,6 +808,27 @@ export function ActionCard({
                     )}
                   </button>
                 )}
+                {onChangeCardTransport && (
+                  <button
+                    type="button"
+                    onClick={() => setShowTransportTools((v) => !v)}
+                    className={`inline-flex items-center gap-1 px-2 py-1 rounded border text-[11px] font-medium transition-colors cursor-pointer ${
+                      typeof haulCostOverrideIsk === 'number'
+                        ? 'border-amber-400/60 bg-amber-500/15 text-amber-200'
+                        : showTransportTools || effectiveTransportCostIsk > 0
+                          ? 'border-cyan-400/50 bg-cyan-500/10 text-cyan-200'
+                          : 'border-slate-700/90 bg-[#0b0e14] text-slate-300 hover:border-cyan-400/50'
+                    }`}
+                  >
+                    <span>
+                      {typeof haulCostOverrideIsk === 'number'
+                        ? `Route Haul: ${formatIsk(haulCostOverrideIsk)}`
+                        : effectiveTransportCostIsk > 0
+                          ? `Transport: ${formatIsk(effectiveTransportCostIsk)}`
+                          : 'Transport / Headroom'}
+                    </span>
+                  </button>
+                )}
                 {onOpenHaulerFlyout && (
                   <button
                     type="button"
@@ -734,6 +840,63 @@ export function ActionCard({
                     <span>Hauler &amp; Fit</span>
                   </button>
                 )}
+              </div>
+            </div>
+          )}
+
+          {/* Per-Card Transport Cost + Min Desired Profit -> Max Absorbed Transport Headroom */}
+          {showTransportTools && onChangeCardTransport && (
+            <div
+              onClick={(e) => e.stopPropagation()}
+              className="px-5 py-2.5 border-t border-slate-800/80 bg-[#0d1420] flex flex-wrap items-center justify-between gap-3 text-xs"
+            >
+              <div className="flex flex-wrap items-center gap-3">
+                <label className="inline-flex items-center gap-1.5 text-slate-300">
+                  <span className="text-[11px] text-slate-400">Transport Cost (M ISK):</span>
+                  <input
+                    type="number"
+                    min={0}
+                    step={0.5}
+                    disabled={typeof haulCostOverrideIsk === 'number'}
+                    value={Number((effectiveTransportCostIsk / 1_000_000).toFixed(2))}
+                    onChange={(e) =>
+                      onChangeCardTransport(
+                        card.id,
+                        Math.max(0, Number(e.target.value) || 0) * 1_000_000,
+                        cardMinDesiredProfitIsk
+                      )
+                    }
+                    className="w-20 bg-[#0b0e14] border border-slate-700 rounded px-2 py-0.5 text-xs font-mono text-slate-100 disabled:opacity-50"
+                  />
+                </label>
+                <label className="inline-flex items-center gap-1.5 text-slate-300">
+                  <span className="text-[11px] text-slate-400">Min Desired Profit (M ISK):</span>
+                  <input
+                    type="number"
+                    min={0}
+                    step={1}
+                    value={Number((cardMinDesiredProfitIsk / 1_000_000).toFixed(2))}
+                    onChange={(e) =>
+                      onChangeCardTransport(
+                        card.id,
+                        cardTransportCostIsk,
+                        Math.max(0, Number(e.target.value) || 0) * 1_000_000
+                      )
+                    }
+                    className="w-20 bg-[#0b0e14] border border-slate-700 rounded px-2 py-0.5 text-xs font-mono text-slate-100"
+                  />
+                </label>
+              </div>
+              <div className="flex items-center gap-2 font-mono text-[11px]">
+                {typeof haulCostOverrideIsk === 'number' && (
+                  <span className="px-1.5 py-0.5 rounded bg-amber-500/15 border border-amber-500/40 text-amber-200">
+                    Overridden in Route Planner
+                  </span>
+                )}
+                <span className="text-slate-400">
+                  Max Absorbed Transport Headroom:{' '}
+                  <strong className="text-cyan-300">{formatIsk(maxAbsorbedTransportIsk)}</strong>
+                </span>
               </div>
             </div>
           )}
@@ -844,10 +1007,14 @@ export function ActionCard({
               >
                 <button
                   type="button"
-                  onClick={() => onChangeExecutionMode('list_orders')}
-                  title="Place Buy/Sell Orders: Sales Tax + NPC Broker Fees"
+                  onClick={() =>
+                    onChangeCardExecutionMode
+                      ? onChangeCardExecutionMode(card.id, 'list_orders')
+                      : onChangeExecutionMode('list_orders')
+                  }
+                  title="Card-specific: Place Buy/Sell Orders (Sales Tax + Exact Standing/Upwell Broker Fee)"
                   className={`px-2 py-0.5 rounded font-medium transition-colors cursor-pointer whitespace-nowrap ${
-                    card.executionMode === 'list_orders'
+                    effectiveExecMode === 'list_orders'
                       ? 'bg-cyan-500/20 text-cyan-200'
                       : 'text-slate-400 hover:text-slate-200'
                   }`}
@@ -856,10 +1023,14 @@ export function ActionCard({
                 </button>
                 <button
                   type="button"
-                  onClick={() => onChangeExecutionMode('instant_fill')}
-                  title="Take Existing Orders: Sales Tax only (0% Broker Fee)"
+                  onClick={() =>
+                    onChangeCardExecutionMode
+                      ? onChangeCardExecutionMode(card.id, 'instant_fill')
+                      : onChangeExecutionMode('instant_fill')
+                  }
+                  title="Card-specific: Instant Fill into existing orders (Sales Tax only, 0% Broker Fee)"
                   className={`px-2 py-0.5 rounded font-medium transition-colors cursor-pointer whitespace-nowrap ${
-                    card.executionMode === 'instant_fill'
+                    effectiveExecMode === 'instant_fill'
                       ? 'bg-emerald-500/20 text-emerald-200'
                       : 'text-slate-400 hover:text-slate-200'
                   }`}
@@ -867,6 +1038,9 @@ export function ActionCard({
                   Instant Fill
                 </button>
               </div>
+              {cardExecutionModeOverride && (
+                <span className="text-[10px] font-mono text-cyan-300/90">Card Override</span>
+              )}
               <span className="text-xs text-slate-500 truncate hidden md:inline">
                 Hull: {card.recommendedHull}
               </span>
@@ -953,6 +1127,7 @@ export function ActionCard({
                 card={card}
                 profile={profile}
                 eveAccessToken={eveAccessToken}
+                appSettings={appSettings}
                 onOpenSsoSettings={onOpenSsoSettings}
               />
             </div>

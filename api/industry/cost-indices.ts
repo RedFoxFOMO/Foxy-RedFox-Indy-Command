@@ -20,18 +20,20 @@ export default async function handler(req: ServerlessReq, res: ServerlessRes) {
 
   try {
     const [sysRes, pricesRes] = await Promise.all([
-      fetch('https://esi.evetech.net/latest/industry/systems/?datasource=tranquility', {
+      fetch('https://esi.evetech.net/industry/systems/?datasource=tranquility', {
         headers: {
           Accept: 'application/json',
+          'X-Compatibility-Date': '2026-08-18',
           'User-Agent':
-            'Foxy-RedFox-Indy-Command/2.1.0 (+https://github.com/RedFoxFOMO/Foxy-RedFox-Indy-Command)',
+            'Foxy-RedFox-Indy-Command/2.2.0 (+https://github.com/RedFoxFOMO/Foxy-RedFox-Indy-Command)',
         },
       }),
-      fetch('https://esi.evetech.net/latest/markets/prices/?datasource=tranquility', {
+      fetch('https://esi.evetech.net/markets/prices/?datasource=tranquility', {
         headers: {
           Accept: 'application/json',
+          'X-Compatibility-Date': '2026-08-18',
           'User-Agent':
-            'Foxy-RedFox-Indy-Command/2.1.0 (+https://github.com/RedFoxFOMO/Foxy-RedFox-Indy-Command)',
+            'Foxy-RedFox-Indy-Command/2.2.0 (+https://github.com/RedFoxFOMO/Foxy-RedFox-Indy-Command)',
         },
       }),
     ]);

@@ -6,6 +6,32 @@ The format follows [Semantic Versioning](https://semver.org/):
 - **MINOR** (`1.0.0` -> `1.1.0`) for new features.
 - **PATCH** (`1.1.0` -> `1.1.1`) for fixes, refinements, and tweaks.
 
+## [2.2.0] - 2026-11-21
+
+### Added
+- **Unified Settings Hub, About Info Popover & Locked Help Tooltips**:
+  - Consolidated all API connections, keys, and preferences into a single 5-tab **Settings** modal (*Connections & APIs*, *Trading & Fee Defaults*, *Industry & Refining Rules*, *Hauling & Route Cadence*, and *UI & Alerts*), retiring duplicate API Setup triggers across the header and footer.
+  - Added Discord Channel Webhook URL configuration with a one-click **Send Test Ping** button (SSRF-hardened proxy) and an optional Share/Paste endpoint configuration.
+  - Added a clickable **`v2.2.0`** About Info popover in the header and footer displaying version info, release date, quick-start tip, author contact (**Reccemaster**), and a direct **Open Settings** shortcut.
+  - Added a global **Tooltips: All On / All Off** preference alongside **Locked Info Tips** (`locked: true`) that remain accessible even when general tooltips are disabled (Settings API setup guides, Remote Order mechanics, and CONCORD TTK exclusions).
+- **2026 EVE ESI Compliance Hardening & Exact NPC Broker Fees**:
+  - Migrated all server, serverless, and client ESI calls to unversioned `https://esi.evetech.net/...` routes with the `X-Compatibility-Date: 2026-08-18` header, updated `User-Agent` to `2.2.0`, added `POST /route/{origin}/{destination}` (`Safer`, `Shorter`, `LessSecure`), and added `/api/esi/status` health checks.
+  - Added the `esi-characters.read_standings.v1` scope and `GET /characters/{id}/standings/` sync to compute exact NPC station broker fees across all 5 Empire Trade Hubs (`max(1.0%, 3.0% - 0.3% × Broker Relations - 0.03% × Faction Standing - 0.02% × Corp Standing)`) plus Upwell custom broker fee and 0.5% SCC surcharge support.
+- **Global UX Upgrades (Trend Ribbons, Universal Qty Override, Card Modes & DOTLAN)**:
+  - Added a multi-period **`30d / 14d / 7d / 1d`** green/red Price Trend Ribbon with selected primary period exact `%` delta and 5-minute session sparkline across opportunity cards, Market Depth, and Station Trading.
+  - Enabled universal `+`/`-` Quantity/Runs Override controls on all action cards, card-specific **List Orders vs. Instant Fill** toggles with a toolbar **"Apply to All Cards"** batch switch, and one-click **DOTLAN** system/route links.
+- **New "Contracts" Tab (Courier & Item/BPC Evaluator)**:
+  - **Courier Evaluator**: Depth-walked package valuation, collateral coverage % with `Under-Valued` / `Fair` / `Over-Valued` / `Bait` flags, 3-leg Approach → Job → Return routing, Round-Trip vs. One-Way timing (hull align, warp AU/s, and manual click cadence), ISK/jump, Income/Job Hr, and Income/Total Hr.
+  - **Item & BPC Evaluator**: Compares Instant Sell, Sell Order, and Reprocess/Refine values; calculates full-run BPC build cost vs. instant output revenue minus contract price (**Residual Profit**) with proportional multi-BPC allocation, `Under-Valued` / `Fair` / `Over-Priced` badges, one-click **Open Contract in EVE**, **Copy Contract Verify Manifest**, clickable column sorting, and **Pin to Route**.
+- **New "Station Trading" Tab**:
+  - Scoped to active Market Scope categories and defaulted to the pilot's **Current Station** (or any of the 5 Empire Trade Hubs) with **Standard Margin**, **Insta-Flip**, and **Hybrid** modes, Daily Volume / Min ROI / Order Range (`Station`, `1j`, `2j`, `3j`) filters, clickable column sorting, expandable **Green-row** live orderbook drawer, and a **Station Material Stock** live market valuation panel.
+- **Industry Slot Controls, Transport Overrides, Route Lifecycle & Inspection Optimizer**:
+  - Added per-card **Transport Cost** and **Min Desired Profit** inputs calculating **Max Absorbed Transport Headroom**, plus a **Route Haul Cost Override** inside the Route Optimizer that automatically restores the card's previous transport cost with an **Undo** toast when cleared.
+  - Added an **Inspection View vs. Order Book View** toggle inside the Inspection Drawer, **3-Stage Refining Location Rules** (*Refine at Pickup*, *Haul Ore → Refine at Base*, *Refine at Max-Yield Hub*), and per-output alternative max-profit destination tables with Lock-In toggles and extra-effort headroom.
+  - Added **Route Lifecycle Tiers** (*Live Session* → *Committed (Named + Timestamped)* → *Completed Archive* with Undo & realized profit ledger), **Depth-Aware Tier-Split** Multi-Buy/Sell exports, and **5 Export Targets** (Clipboard Text/CSV, File `.txt`/`.csv`/`.json`, clean `@media print` PDF/Print layout, Shareable Paste/Link, and Discord Webhook Push).
+- **New "Gank" Tactical Evaluator Tab**:
+  - Evaluates **Threat vs. Target/Victim** engagements using ESI-synced ships or catalog hulls, live **zKillboard + ESI** pilot intel lookups, a **Ship & Cargo Scanner** paste parser, **Fight vs. Evade** tactical verdict, Cost-Benefit breakdown, and **TTK vs. Time-to-Be-Killed** strictly excluding CONCORD intervention (with a Locked Info Tip).
+
 ## [2.1.0] - 2026-11-20
 
 ### Added

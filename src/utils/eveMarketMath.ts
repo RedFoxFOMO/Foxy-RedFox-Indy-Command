@@ -24,7 +24,8 @@ import type {
 } from '../types/eve.ts';
 
 export const EVE_USER_AGENT =
-  'Foxy-RedFox-Indy-Command/2.1.0 (+https://github.com/RedFoxFOMO/Foxy-RedFox-Indy-Command)';
+  'Foxy-RedFox-Indy-Command/2.2.0 (+https://github.com/RedFoxFOMO/Foxy-RedFox-Indy-Command)';
+export const ESI_COMPAT_DATE = '2026-08-18';
 
 // --- 1. Exact EVE Online 4-Significant-Figure Tick Math ---
 

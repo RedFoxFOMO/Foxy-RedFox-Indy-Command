@@ -102,12 +102,14 @@ async function fetchWithTimeout(url: string, init: RequestInit = {}, timeoutMs =
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
+    const isEsi = url.includes('esi.evetech.net');
     return await fetch(url, {
       ...init,
       signal: controller.signal,
       headers: {
         Accept: 'application/json',
         'User-Agent': EVE_USER_AGENT,
+        ...(isEsi ? { 'X-Compatibility-Date': '2026-08-18' } : {}),
         ...(init.headers || {}),
       },
     });
@@ -197,7 +199,7 @@ async function fetchEsiCorridorOrdersForTypes(
     await Promise.all(
       batch.map(async (typeId) => {
         try {
-          const url = `https://esi.evetech.net/latest/markets/${EVE_ANCHORS.THE_FORGE_REGION_ID}/orders/?datasource=tranquility&order_type=all&type_id=${typeId}`;
+          const url = `https://esi.evetech.net/markets/${EVE_ANCHORS.THE_FORGE_REGION_ID}/orders/?datasource=tranquility&order_type=all&type_id=${typeId}`;
           const res = await fetchWithTimeout(url, {}, 6500);
           if (!res.ok) return;
           const rawOrders = (await res.json()) as EsiOrderRaw[];
@@ -440,8 +442,8 @@ app.get('/api/industry/cost-indices', async (req, res) => {
     }
 
     const [sysRes, pricesRes] = await Promise.all([
-      fetchWithTimeout('https://esi.evetech.net/latest/industry/systems/?datasource=tranquility', {}, 12000),
-      fetchWithTimeout('https://esi.evetech.net/latest/markets/prices/?datasource=tranquility', {}, 12000),
+      fetchWithTimeout('https://esi.evetech.net/industry/systems/?datasource=tranquility', {}, 12000),
+      fetchWithTimeout('https://esi.evetech.net/markets/prices/?datasource=tranquility', {}, 12000),
     ]);
 
     const costIndicesBySystem: Record<number, SystemCostIndices> = {};
@@ -631,7 +633,7 @@ app.get('/api/market/history', async (req, res) => {
       return;
     }
 
-    const url = `https://esi.evetech.net/latest/markets/${allowedRegion}/history/?datasource=tranquility&type_id=${typeId}`;
+    const url = `https://esi.evetech.net/markets/${allowedRegion}/history/?datasource=tranquility&type_id=${typeId}`;
     const esiRes = await fetchWithTimeout(url, {}, 8500);
 
     if (esiRes.status === 400 || esiRes.status === 404) {
@@ -720,7 +722,7 @@ async function postUniverseNamesChunk(chunk: number[]): Promise<{ id: number; na
   if (chunk.length === 0) return [];
   try {
     const res = await fetchWithTimeout(
-      'https://esi.evetech.net/latest/universe/names/?datasource=tranquility',
+      'https://esi.evetech.net/universe/names/?datasource=tranquility',
       {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -745,7 +747,7 @@ async function postUniverseNamesChunk(chunk: number[]): Promise<{ id: number; na
     // Single-ID fallback via /universe/types/{id}/ for special blueprint types not indexed by /universe/names/
     if (res.status === 404 && chunk.length === 1) {
       const typeRes = await fetchWithTimeout(
-        `https://esi.evetech.net/latest/universe/types/${chunk[0]}/?datasource=tranquility`,
+        `https://esi.evetech.net/universe/types/${chunk[0]}/?datasource=tranquility`,
         {},
         5000
       );
@@ -803,7 +805,7 @@ async function getLiveSystemKills(): Promise<{ map: Map<number, SystemKillRaw>; 
   const map = new Map<number, SystemKillRaw>();
   try {
     const res = await fetchWithTimeout(
-      'https://esi.evetech.net/latest/universe/system_kills/?datasource=tranquility',
+      'https://esi.evetech.net/universe/system_kills/?datasource=tranquility',
       {},
       8000
     );
@@ -834,7 +836,7 @@ async function getLiveSystemKills(): Promise<{ map: Map<number, SystemKillRaw>; 
 async function fetchEsiRoutePath(
   origin: number,
   destination: number,
-  preference: 'Safer' | 'Shorter',
+  preference: 'Safer' | 'Shorter' | 'LessSecure',
   avoidSystems: number[]
 ): Promise<{ jumps: number; waypoints: number[] }> {
   if (origin === destination) return { jumps: 0, waypoints: [origin] };
@@ -855,10 +857,13 @@ async function fetchEsiRoutePath(
     return { jumps: cached.jumps, waypoints: cached.waypoints };
   }
 
-  // Primary: POST https://esi.evetech.net/route/{origin}/{destination}
+  // 2026 ESI Primary: POST https://esi.evetech.net/route/{origin}/{destination}
   try {
     const postUrl = `https://esi.evetech.net/route/${origin}/${destination}`;
-    const postPayload: { preference: 'Safer' | 'Shorter'; avoid_systems?: number[] } = {
+    const postPayload: {
+      preference: 'Safer' | 'Shorter' | 'LessSecure';
+      avoid_systems?: number[];
+    } = {
       preference,
     };
     if (cleanAvoid.length > 0) {
@@ -898,30 +903,7 @@ async function fetchEsiRoutePath(
         return { jumps, waypoints: routeArr };
       }
     }
-  } catch {
-    // Fall through to GET route endpoint
-  }
-
-  // Fallback: GET https://esi.evetech.net/latest/route/{origin}/{destination}/?flag=secure|shortest&avoid=...
-  const flag = preference === 'Safer' ? 'secure' : 'shortest';
-  const qs = new URLSearchParams({ datasource: 'tranquility', flag });
-  for (const avoidId of cleanAvoid.slice(0, 40)) {
-    qs.append('avoid', String(avoidId));
-  }
-  const getUrl = `https://esi.evetech.net/latest/route/${origin}/${destination}/?${qs.toString()}`;
-  try {
-    const getRes = await fetchWithTimeout(getUrl, {}, 7500);
-    if (getRes.ok) {
-      const arr = (await getRes.json()) as unknown;
-      if (Array.isArray(arr) && arr.length > 0) {
-        const waypoints = arr.map(Number).filter((n) => Number.isInteger(n) && n > 0);
-        const jumps = Math.max(0, waypoints.length - 1);
-        routePathCache.set(cacheKey, { jumps, waypoints, fetchedAt: Date.now() });
-        return { jumps, waypoints };
-      }
-    }
-    // If avoiding hot systems yields 404 (no path exists), retry without avoid so pilot still gets a route
-    if (getRes.status === 404 && cleanAvoid.length > 0) {
+    if (postRes.status === 404 && cleanAvoid.length > 0) {
       return fetchEsiRoutePath(origin, destination, preference, []);
     }
   } catch {
@@ -947,11 +929,16 @@ app.post('/api/route/distances', async (req, res) => {
   try {
     const { pairs, preference, avoidSystems } = req.body as {
       pairs?: { origin: number; destination: number }[];
-      preference?: 'Safer' | 'Shorter';
+      preference?: 'Safer' | 'Shorter' | 'LessSecure';
       avoidSystems?: number[];
     };
 
-    const pref: 'Safer' | 'Shorter' = preference === 'Shorter' ? 'Shorter' : 'Safer';
+    const pref: 'Safer' | 'Shorter' | 'LessSecure' =
+      preference === 'Shorter'
+        ? 'Shorter'
+        : preference === 'LessSecure'
+          ? 'LessSecure'
+          : 'Safer';
     const avoidList = Array.isArray(avoidSystems)
       ? avoidSystems.map(Number).filter((n) => Number.isInteger(n) && n > 0)
       : [];
@@ -1075,7 +1062,7 @@ async function fetchSolarSystemCoord(systemId: number): Promise<CachedSystemCoor
 
   try {
     const res = await fetchWithTimeout(
-      `https://esi.evetech.net/latest/universe/systems/${systemId}/?datasource=tranquility`,
+      `https://esi.evetech.net/universe/systems/${systemId}/?datasource=tranquility`,
       {},
       7000
     );
@@ -1193,7 +1180,7 @@ async function resolveSystemRegionId(systemId: number): Promise<number | null> {
 
   try {
     const sysRes = await fetchWithTimeout(
-      `https://esi.evetech.net/latest/universe/systems/${systemId}/?datasource=tranquility`,
+      `https://esi.evetech.net/universe/systems/${systemId}/?datasource=tranquility`,
       {},
       6000
     );
@@ -1209,7 +1196,7 @@ async function resolveSystemRegionId(systemId: number): Promise<number | null> {
     }
 
     const constRes = await fetchWithTimeout(
-      `https://esi.evetech.net/latest/universe/constellations/${constId}/?datasource=tranquility`,
+      `https://esi.evetech.net/universe/constellations/${constId}/?datasource=tranquility`,
       {},
       6000
     );
@@ -1271,7 +1258,7 @@ async function fetchTopRegionalOrders(
     };
   }
 
-  const url = `https://esi.evetech.net/latest/markets/${regionId}/orders/?datasource=tranquility&order_type=${orderType}&type_id=${typeId}`;
+  const url = `https://esi.evetech.net/markets/${regionId}/orders/?datasource=tranquility&order_type=${orderType}&type_id=${typeId}`;
   const res = await esiCachedFetchJson<EsiMarketOrderRaw[]>(
     url,
     {},
@@ -1455,7 +1442,7 @@ app.get('/api/route/resolve-system', async (req, res) => {
     if (/^\d{7,9}$/.test(raw)) {
       const id = Number(raw);
       const sysRes = await fetchWithTimeout(
-        `https://esi.evetech.net/latest/universe/systems/${id}/?datasource=tranquility`,
+        `https://esi.evetech.net/universe/systems/${id}/?datasource=tranquility`,
         {},
         7000
       );
@@ -1472,7 +1459,7 @@ app.get('/api/route/resolve-system', async (req, res) => {
 
     // Exact name lookup via ESI POST /universe/ids/
     const idRes = await fetchWithTimeout(
-      'https://esi.evetech.net/latest/universe/ids/?datasource=tranquility',
+      'https://esi.evetech.net/universe/ids/?datasource=tranquility',
       {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -1672,7 +1659,7 @@ async function resolveStationInfo(
   if (stationId >= 60_000_000 && stationId < 70_000_000) {
     try {
       const stRes = await fetchWithTimeout(
-        `https://esi.evetech.net/latest/universe/stations/${stationId}/?datasource=tranquility`,
+        `https://esi.evetech.net/universe/stations/${stationId}/?datasource=tranquility`,
         {},
         6500
       );
@@ -1901,7 +1888,7 @@ app.post('/api/eve/sync-character', async (req, res) => {
     }
 
     const esiHeaders = { Authorization: `Bearer ${accessToken}` };
-    const base = `https://esi.evetech.net/latest/characters/${characterId}`;
+    const base = `https://esi.evetech.net/characters/${characterId}`;
 
     const [
       charInfoRes,
@@ -1913,6 +1900,7 @@ app.post('/api/eve/sync-character', async (req, res) => {
       personalBpResult,
       assetsPage1Res,
       industryJobsRes,
+      standingsRes,
     ] = await Promise.all([
       fetchWithTimeout(`${base}/?datasource=tranquility`),
       fetchWithTimeout(`${base}/wallet/?datasource=tranquility`, { headers: esiHeaders }),
@@ -1925,7 +1913,40 @@ app.post('/api/eve/sync-character', async (req, res) => {
       fetchWithTimeout(`${base}/industry/jobs/?datasource=tranquility&include_completed=false`, {
         headers: esiHeaders,
       }),
+      fetchWithTimeout(`${base}/standings/?datasource=tranquility`, { headers: esiHeaders }),
     ]);
+
+    // Parse NPC standings (gracefully degrades to 0.0 if existing SSO token lacks esi-characters.read_standings.v1)
+    const npcStandings: {
+      factions: Record<number, number>;
+      corps: Record<number, number>;
+      hasScope: boolean;
+      syncedAt?: string;
+    } = {
+      factions: {},
+      corps: {},
+      hasScope: false,
+    };
+    if (standingsRes.ok) {
+      try {
+        const rawStandings = (await standingsRes.json()) as {
+          from_id: number;
+          from_type: 'agent' | 'npc_corp' | 'faction';
+          standing: number;
+        }[];
+        if (Array.isArray(rawStandings)) {
+          npcStandings.hasScope = true;
+          npcStandings.syncedAt = new Date().toISOString();
+          for (const st of rawStandings) {
+            if (!st || typeof st.from_id !== 'number' || typeof st.standing !== 'number') continue;
+            if (st.from_type === 'faction') npcStandings.factions[st.from_id] = st.standing;
+            else if (st.from_type === 'npc_corp') npcStandings.corps[st.from_id] = st.standing;
+          }
+        }
+      } catch {
+        // graceful fallback
+      }
+    }
 
     let corporationId: number | undefined;
     if (charInfoRes.ok) {
@@ -2091,7 +2112,7 @@ app.post('/api/eve/sync-character', async (req, res) => {
 
     if (includeCorpBlueprints && corporationId) {
       const corpResult = await fetchAllPaginatedBlueprints(
-        `https://esi.evetech.net/latest/corporations/${corporationId}/blueprints/`,
+        `https://esi.evetech.net/corporations/${corporationId}/blueprints/`,
         esiHeaders
       );
       if (corpResult.status === 200) {
@@ -2408,6 +2429,18 @@ app.post('/api/eve/sync-character', async (req, res) => {
       syncedAt: new Date().toISOString(),
     };
 
+    // Build per-station raw hangar asset counts for Station Trading material stock valuation
+    const stationAssetsByLocation: Record<number, Record<number, number>> = {};
+    for (const a of allAssets) {
+      const flag = a.location_flag || '';
+      if (flag !== 'Hangar' && !flag.startsWith('CorpSAG')) continue;
+      const locId = a.location_id;
+      const qty = Math.max(1, a.quantity ?? 1);
+      if (!stationAssetsByLocation[locId]) stationAssetsByLocation[locId] = {};
+      stationAssetsByLocation[locId][a.type_id] =
+        (stationAssetsByLocation[locId][a.type_id] ?? 0) + qty;
+    }
+
     res.json({
       characterId,
       corporationId,
@@ -2428,6 +2461,8 @@ app.post('/api/eve/sync-character', async (req, res) => {
       industryJobs,
       industryJobsSyncedAt: new Date().toISOString(),
       hangarStock,
+      npcStandings,
+      stationAssetsByLocation,
     });
   } catch (err) {
     console.error('ESI character sync error:', err);
@@ -2451,7 +2486,7 @@ app.post('/api/eve/wallet-orders', async (req, res) => {
     }
 
     const esiHeaders = { Authorization: `Bearer ${accessToken}` };
-    const base = `https://esi.evetech.net/latest/characters/${characterId}`;
+    const base = `https://esi.evetech.net/characters/${characterId}`;
 
     const [walletRes, ordersRes] = await Promise.all([
       fetchWithTimeout(`${base}/wallet/?datasource=tranquility`, { headers: esiHeaders }, 7000),
@@ -2530,7 +2565,7 @@ app.post('/api/eve/industry-jobs', async (req, res) => {
 
     const esiHeaders = { Authorization: `Bearer ${accessToken}` };
     const jobsRes = await fetchWithTimeout(
-      `https://esi.evetech.net/latest/characters/${characterId}/industry/jobs/?datasource=tranquility&include_completed=false`,
+      `https://esi.evetech.net/characters/${characterId}/industry/jobs/?datasource=tranquility&include_completed=false`,
       { headers: esiHeaders },
       9000
     );
@@ -2651,7 +2686,7 @@ app.post('/api/eve/order-monitor', async (req, res) => {
     }
 
     const esiHeaders = { Authorization: `Bearer ${accessToken}` };
-    const base = `https://esi.evetech.net/latest/characters/${characterId}`;
+    const base = `https://esi.evetech.net/characters/${characterId}`;
 
     const [ordersRes, txRes] = await Promise.all([
       fetchWithTimeout(`${base}/orders/?datasource=tranquility`, { headers: esiHeaders }, 9000),
@@ -2876,7 +2911,7 @@ app.post('/api/eve/undercut-watchdog', async (req, res) => {
         issued: string;
       }[]
     >(
-      `https://esi.evetech.net/latest/characters/${characterId}/orders/?datasource=tranquility`,
+      `https://esi.evetech.net/characters/${characterId}/orders/?datasource=tranquility`,
       { headers: { Authorization: `Bearer ${accessToken}` } },
       { timeoutMs: 8500, fallbackTtlMs: ORDER_BOOK_TTL_MS, cacheKey: `char-orders:${characterId}` }
     );
@@ -3087,7 +3122,7 @@ app.post('/api/eve/blueprints', async (req, res) => {
     }
 
     const esiHeaders = { Authorization: `Bearer ${accessToken}` };
-    const base = `https://esi.evetech.net/latest/characters/${characterId}`;
+    const base = `https://esi.evetech.net/characters/${characterId}`;
 
     // Resolve corporationId if caller did not pass it yet
     let corporationId = reqCorpId;
@@ -3123,7 +3158,7 @@ app.post('/api/eve/blueprints', async (req, res) => {
 
     if (includeCorpBlueprints && corporationId) {
       const corpResult = await fetchAllPaginatedBlueprints(
-        `https://esi.evetech.net/latest/corporations/${corporationId}/blueprints/`,
+        `https://esi.evetech.net/corporations/${corporationId}/blueprints/`,
         esiHeaders
       );
       if (corpResult.status === 200) {
@@ -3203,7 +3238,7 @@ app.post('/api/eve/autopilot/waypoint', async (req, res) => {
       for (let i = 0; i < cleanIds.length; i++) {
         const destId = cleanIds[i];
         const clear = i === 0;
-        const url = `https://esi.evetech.net/latest/ui/autopilot/waypoint/?datasource=tranquility&destination_id=${destId}&clear_other_waypoints=${clear}&add_to_beginning=false`;
+        const url = `https://esi.evetech.net/ui/autopilot/waypoint/?datasource=tranquility&destination_id=${destId}&clear_other_waypoints=${clear}&add_to_beginning=false`;
         const esiRes = await fetchWithTimeout(
           url,
           {
@@ -3245,7 +3280,7 @@ app.post('/api/eve/autopilot/waypoint', async (req, res) => {
 
     const clear = clearOtherWaypoints !== false;
     const addBeg = Boolean(addToBeginning);
-    const url = `https://esi.evetech.net/latest/ui/autopilot/waypoint/?datasource=tranquility&destination_id=${dest}&clear_other_waypoints=${clear}&add_to_beginning=${addBeg}`;
+    const url = `https://esi.evetech.net/ui/autopilot/waypoint/?datasource=tranquility&destination_id=${dest}&clear_other_waypoints=${clear}&add_to_beginning=${addBeg}`;
     const esiRes = await fetchWithTimeout(
       url,
       {
@@ -3301,7 +3336,7 @@ app.post('/api/eve/ui/open-market', async (req, res) => {
     if ((!Number.isInteger(typeId) || typeId <= 0) && itemName && itemName.trim()) {
       try {
         const idRes = await fetchWithTimeout(
-          'https://esi.evetech.net/latest/universe/ids/?datasource=tranquility',
+          'https://esi.evetech.net/universe/ids/?datasource=tranquility',
           {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
@@ -3326,7 +3361,7 @@ app.post('/api/eve/ui/open-market', async (req, res) => {
       return;
     }
 
-    const url = `https://esi.evetech.net/latest/ui/openwindow/marketdetails/?datasource=tranquility&type_id=${typeId}`;
+    const url = `https://esi.evetech.net/ui/openwindow/marketdetails/?datasource=tranquility&type_id=${typeId}`;
     const esiRes = await fetchWithTimeout(
       url,
       {
@@ -3353,6 +3388,423 @@ app.post('/api/eve/ui/open-market', async (req, res) => {
   } catch (err) {
     console.error('ESI open marketdetails error:', err);
     res.status(500).json({ error: 'Failed to contact EVE Online ESI Open Window endpoint.' });
+  }
+});
+
+// --- v2.2.0 Route A: 2026 ESI Tranquility Status Health Check (unversioned /status) ---
+
+app.get('/api/esi/status', async (_req, res) => {
+  try {
+    const r = await fetchWithTimeout('https://esi.evetech.net/status?datasource=tranquility', {}, 6000);
+    if (!r.ok) {
+      res.status(r.status).json({ ok: false, error: `ESI /status returned HTTP ${r.status}` });
+      return;
+    }
+    const data = (await r.json()) as { players?: number; server_version?: string; start_time?: string };
+    res.json({
+      ok: true,
+      players: data.players ?? 0,
+      serverVersion: data.server_version ?? '',
+      startTime: data.start_time ?? '',
+      compatibilityDate: '2026-08-18',
+      checkedAt: new Date().toISOString(),
+    });
+  } catch {
+    res.status(502).json({ ok: false, error: 'Unable to reach EVE ESI /status endpoint.' });
+  }
+});
+
+// --- v2.2.0 Route B: Public Regional Contracts + Batch Contract Items (ETag & Rate-Limit Shielded) ---
+
+const publicContractsCache = new Map<string, { payload: unknown; expiresAt: number }>();
+
+app.get('/api/contracts/public', async (req, res) => {
+  try {
+    const rawRegion = Number(req.query.regionId || EVE_ANCHORS.THE_FORGE_REGION_ID);
+    const regionId = Number.isInteger(rawRegion) && rawRegion > 10_000_000 ? rawRegion : EVE_ANCHORS.THE_FORGE_REGION_ID;
+    const rawPage = Number(req.query.page || 1);
+    const page = Number.isInteger(rawPage) && rawPage >= 1 && rawPage <= 10 ? rawPage : 1;
+    const contractType = String(req.query.type || 'all');
+    const maxItemsToHydrate = Math.min(20, Math.max(4, Number(req.query.hydrateCount || 14)));
+
+    const cacheKey = `${regionId}:${page}:${contractType}`;
+    const hit = publicContractsCache.get(cacheKey);
+    if (hit && Date.now() < hit.expiresAt) {
+      res.json(hit.payload);
+      return;
+    }
+
+    const listUrl = `https://esi.evetech.net/contracts/public/${regionId}?datasource=tranquility&page=${page}`;
+    const listRes = await esiCachedFetchJson<
+      {
+        contract_id: number;
+        type: string;
+        title?: string;
+        price?: number;
+        reward?: number;
+        collateral?: number;
+        volume?: number;
+        start_location_id?: number;
+        end_location_id?: number;
+        days_to_complete?: number;
+        date_issued?: string;
+        date_expired?: string;
+        issuer_id?: number;
+      }[]
+    >(listUrl, {}, { timeoutMs: 8500, fallbackTtlMs: 300_000 });
+
+    const rawList = Array.isArray(listRes.data) ? listRes.data : [];
+    const filtered = rawList
+      .filter((c) => {
+        if (contractType === 'courier') return c.type === 'courier';
+        if (contractType === 'item_exchange') return c.type === 'item_exchange' || c.type === 'auction';
+        return c.type === 'courier' || c.type === 'item_exchange' || c.type === 'auction';
+      })
+      .slice(0, 30);
+
+    // Hydrate station/system info & batch contract items for top entries
+    const locationIds = new Set<number>();
+    for (const c of filtered) {
+      if (c.start_location_id && c.start_location_id < 100_000_000) locationIds.add(c.start_location_id);
+      if (c.end_location_id && c.end_location_id < 100_000_000) locationIds.add(c.end_location_id);
+    }
+
+    const stationInfoById = new Map<number, { name: string; systemId: number; systemName: string }>();
+    await Promise.all(
+      Array.from(locationIds).slice(0, 24).map(async (stId) => {
+        const info = await resolveStationInfo(stId);
+        if (info) stationInfoById.set(stId, info);
+      })
+    );
+
+    const itemExchangeContracts = filtered
+      .filter((c) => c.type === 'item_exchange' || c.type === 'auction')
+      .slice(0, maxItemsToHydrate);
+
+    const itemsByContractId = new Map<
+      number,
+      {
+        recordId: number;
+        typeId: number;
+        name: string;
+        quantity: number;
+        isIncluded: boolean;
+        isBlueprintCopy?: boolean;
+        materialEfficiency?: number;
+        timeEfficiency?: number;
+        runs?: number;
+      }[]
+    >();
+
+    const unknownTypeIds = new Set<number>();
+    await Promise.all(
+      itemExchangeContracts.map(async (c) => {
+        const itemUrl = `https://esi.evetech.net/contracts/public/items/${c.contract_id}?datasource=tranquility`;
+        const itemRes = await esiCachedFetchJson<
+          {
+            record_id: number;
+            type_id: number;
+            quantity: number;
+            is_included: boolean;
+            is_blueprint_copy?: boolean;
+            material_efficiency?: number;
+            time_efficiency?: number;
+            runs?: number;
+          }[]
+        >(itemUrl, {}, { timeoutMs: 5500, fallbackTtlMs: 300_000 });
+        if (Array.isArray(itemRes.data)) {
+          const mapped = itemRes.data.slice(0, 40).map((it) => {
+            const known = ITEM_BY_ID[it.type_id]?.name || entityNameCache.get(it.type_id);
+            if (!known) unknownTypeIds.add(it.type_id);
+            return {
+              recordId: it.record_id,
+              typeId: it.type_id,
+              name: known || `Type #${it.type_id}`,
+              quantity: it.quantity,
+              isIncluded: Boolean(it.is_included),
+              isBlueprintCopy: Boolean(it.is_blueprint_copy),
+              materialEfficiency: it.material_efficiency,
+              timeEfficiency: it.time_efficiency,
+              runs: it.runs,
+            };
+          });
+          itemsByContractId.set(c.contract_id, mapped);
+        }
+      })
+    );
+
+    if (unknownTypeIds.size > 0) {
+      await resolveUniverseNames(Array.from(unknownTypeIds).slice(0, 200));
+      for (const list of itemsByContractId.values()) {
+        for (const it of list) {
+          if (it.name.startsWith('Type #')) {
+            const resolved = entityNameCache.get(it.typeId);
+            if (resolved) it.name = resolved;
+          }
+        }
+      }
+    }
+
+    const hydrated = filtered.map((c) => {
+      const startInfo = c.start_location_id ? stationInfoById.get(c.start_location_id) : undefined;
+      const endInfo = c.end_location_id ? stationInfoById.get(c.end_location_id) : undefined;
+      return {
+        ...c,
+        start_system_id: startInfo?.systemId,
+        start_system_name: startInfo?.systemName || 'Citadel / System',
+        start_station_name: startInfo?.name || (c.start_location_id ? `Structure #${c.start_location_id}` : 'Unknown Station'),
+        end_system_id: endInfo?.systemId,
+        end_system_name: endInfo?.systemName || 'Citadel / System',
+        end_station_name: endInfo?.name || (c.end_location_id ? `Structure #${c.end_location_id}` : 'Unknown Station'),
+        items: itemsByContractId.get(c.contract_id) ?? [],
+      };
+    });
+
+    const payload = {
+      regionId,
+      page,
+      contracts: hydrated,
+      cacheMeta: getEsiCacheTelemetry('active_sync'),
+      fetchedAt: new Date().toISOString(),
+    };
+    publicContractsCache.set(cacheKey, { payload, expiresAt: Date.now() + 180_000 });
+    res.json(payload);
+  } catch (err) {
+    console.error('Public contracts route error:', err);
+    res.status(500).json({ error: 'Unable to fetch live public contracts from EVE ESI.' });
+  }
+});
+
+// --- v2.2.0 Route C: Open Contract Window In-Game (esi-ui.open_window.v1) ---
+
+app.post('/api/eve/ui/open-contract', async (req, res) => {
+  try {
+    const authHeader = req.headers.authorization || '';
+    const accessToken = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : '';
+    const contractId = Number((req.body as { contractId?: number }).contractId);
+
+    if (!accessToken) {
+      res.status(401).json({ error: 'Connect EVE SSO to open contracts directly inside your EVE client.' });
+      return;
+    }
+    if (!Number.isInteger(contractId) || contractId <= 0) {
+      res.status(400).json({ error: 'Valid positive integer contractId is required.' });
+      return;
+    }
+
+    const url = `https://esi.evetech.net/ui/openwindow/contract/?datasource=tranquility&contract_id=${contractId}`;
+    const esiRes = await fetchWithTimeout(
+      url,
+      {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${accessToken}` },
+      },
+      7000
+    );
+
+    if (!esiRes.ok) {
+      res.status(esiRes.status).json({
+        error:
+          esiRes.status === 403
+            ? 'Missing esi-ui.open_window.v1 scope. Re-connect EVE SSO in Settings.'
+            : `EVE ESI Open Contract returned HTTP ${esiRes.status}.`,
+      });
+      return;
+    }
+
+    res.json({ ok: true, contractId });
+  } catch {
+    res.status(500).json({ error: 'Failed to contact EVE ESI Open Contract Window endpoint.' });
+  }
+});
+
+// --- v2.2.0 Route D: Gank Tab Pilot Intel Lookup (Public ESI + zKillboard Stats) ---
+
+app.post('/api/gank/pilot-intel', async (req, res) => {
+  try {
+    const rawName = String((req.body as { characterName?: string }).characterName || '').trim();
+    if (!rawName || rawName.length < 2 || rawName.length > 64) {
+      res.status(400).json({ error: 'Provide a valid EVE character name (2-64 characters).' });
+      return;
+    }
+
+    const idRes = await fetchWithTimeout(
+      'https://esi.evetech.net/universe/ids/?datasource=tranquility',
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify([rawName]),
+      },
+      7000
+    );
+
+    if (!idRes.ok) {
+      res.status(502).json({ error: 'EVE ESI character lookup temporarily unavailable.' });
+      return;
+    }
+
+    const idJson = (await idRes.json()) as { characters?: { id: number; name: string }[] };
+    const found = idJson.characters?.[0];
+    if (!found) {
+      res.status(404).json({ error: `No EVE capsuleer found matching "${rawName}".` });
+      return;
+    }
+
+    const [charRes, zkillRes] = await Promise.all([
+      fetchWithTimeout(`https://esi.evetech.net/characters/${found.id}/?datasource=tranquility`, {}, 6000),
+      fetchWithTimeout(`https://zkillboard.com/api/stats/characterID/${found.id}/`, {}, 6500).catch(() => null),
+    ]);
+
+    let corporationName = 'Unknown Corporation';
+    let securityStatus = 0;
+    if (charRes.ok) {
+      const charInfo = (await charRes.json()) as {
+        corporation_id?: number;
+        security_status?: number;
+      };
+      securityStatus = Number((charInfo.security_status ?? 0).toFixed(2));
+      if (charInfo.corporation_id) {
+        const corpRes = await fetchWithTimeout(
+          `https://esi.evetech.net/corporations/${charInfo.corporation_id}/?datasource=tranquility`,
+          {},
+          5000
+        ).catch(() => null);
+        if (corpRes && corpRes.ok) {
+          const corpJson = (await corpRes.json()) as { name?: string };
+          if (corpJson.name) corporationName = corpJson.name;
+        }
+      }
+    }
+
+    let shipsDestroyed = 0;
+    let shipsLost = 0;
+    let dangerRatio = 50;
+    let gangRatio = 50;
+    let source: 'zkill_live' | 'esi_only' = 'esi_only';
+
+    if (zkillRes && zkillRes.ok) {
+      try {
+        const zk = (await zkillRes.json()) as {
+          shipsDestroyed?: number;
+          shipsLost?: number;
+          dangerRatio?: number;
+          gangRatio?: number;
+        };
+        shipsDestroyed = Number(zk.shipsDestroyed ?? 0);
+        shipsLost = Number(zk.shipsLost ?? 0);
+        dangerRatio = Number(zk.dangerRatio ?? 50);
+        gangRatio = Number(zk.gangRatio ?? 50);
+        source = 'zkill_live';
+      } catch {
+        // graceful fallback
+      }
+    }
+
+    const posture: 'ganker_threat' | 'victim_target' | 'mixed_unknown' =
+      securityStatus <= -2.0 || (source === 'zkill_live' && dangerRatio >= 65 && shipsDestroyed >= 15)
+        ? 'ganker_threat'
+        : source === 'zkill_live' && dangerRatio <= 30 && shipsLost >= 3
+          ? 'victim_target'
+          : 'mixed_unknown';
+
+    const summary =
+      posture === 'ganker_threat'
+        ? `High threat posture (${dangerRatio}% danger, sec ${securityStatus.toFixed(1)}, ${shipsDestroyed.toLocaleString('en-US')} kills). Treat as active ganker / combat hunter.`
+        : posture === 'victim_target'
+          ? `Low combat danger (${dangerRatio}% danger, ${shipsLost.toLocaleString('en-US')} losses). Historically industrial/PvE target profile.`
+          : `Mixed or limited killboard profile (sec ${securityStatus.toFixed(1)}, ${shipsDestroyed} kills / ${shipsLost} losses). Verify on D-Scan & Ship Scanner.`;
+
+    res.json({
+      characterId: found.id,
+      characterName: found.name,
+      corporationName,
+      securityStatus,
+      posture,
+      shipsDestroyed,
+      shipsLost,
+      dangerRatio,
+      gangRatio,
+      source,
+      summary,
+    });
+  } catch (err) {
+    console.error('Pilot intel lookup error:', err);
+    res.status(500).json({ error: 'Unable to retrieve pilot intel.' });
+  }
+});
+
+// --- v2.2.0 Route E: SSRF-Hardened Discord Channel Webhook Proxy ---
+
+const ALLOWED_DISCORD_HOSTS = new Set([
+  'discord.com',
+  'discordapp.com',
+  'canary.discord.com',
+  'ptb.discord.com',
+]);
+
+function validateDiscordWebhookUrl(raw: string): URL | null {
+  try {
+    const parsed = new URL(raw.trim());
+    if (parsed.protocol !== 'https:') return null;
+    if (!ALLOWED_DISCORD_HOSTS.has(parsed.hostname.toLowerCase())) return null;
+    if (!/^\/api\/webhooks\/\d+\/[A-Za-z0-9_-]+$/.test(parsed.pathname)) return null;
+    return parsed;
+  } catch {
+    return null;
+  }
+}
+
+app.post('/api/integrations/discord-webhook', async (req, res) => {
+  try {
+    const { webhookUrl, content, embeds } = req.body as {
+      webhookUrl?: string;
+      content?: string;
+      embeds?: unknown[];
+    };
+
+    const validUrl = validateDiscordWebhookUrl(String(webhookUrl || ''));
+    if (!validUrl) {
+      res.status(400).json({
+        error:
+          'Invalid Discord Webhook URL. Must be an HTTPS URL matching https://discord.com/api/webhooks/<id>/<token>.',
+      });
+      return;
+    }
+
+    const safeContent = String(content || '').slice(0, 1900);
+    if (!safeContent && (!Array.isArray(embeds) || embeds.length === 0)) {
+      res.status(400).json({ error: 'Message content or embed payload is required.' });
+      return;
+    }
+
+    const payload: Record<string, unknown> = {
+      username: 'Foxy RedFox Indy Command v2.2.0',
+    };
+    if (safeContent) payload.content = safeContent;
+    if (Array.isArray(embeds) && embeds.length > 0) {
+      payload.embeds = embeds.slice(0, 4);
+    }
+
+    const hookRes = await fetchWithTimeout(
+      validUrl.toString(),
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      },
+      7500
+    );
+
+    if (!hookRes.ok) {
+      res.status(hookRes.status).json({
+        error: `Discord Webhook returned HTTP ${hookRes.status}. Verify the channel webhook is still active.`,
+      });
+      return;
+    }
+
+    res.json({ ok: true, sentAt: new Date().toISOString() });
+  } catch {
+    res.status(502).json({ error: 'Unable to reach Discord webhook endpoint.' });
   }
 });
 

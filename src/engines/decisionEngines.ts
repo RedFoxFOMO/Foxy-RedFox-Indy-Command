@@ -15,10 +15,13 @@ import {
   walkBuyOrderbookForSell,
   walkSellOrderbookForBuy,
 } from '../utils/eveMarketMath.ts';
+import { computeExactHubBrokerFee, resolveHubIdFromSystemOrRegion } from '../utils/dotlan.ts';
+import { deriveQuickMultiPeriodTrend } from '../utils/v22Engines.ts';
 import type {
   ActionCardData,
   ActiveMarketOrder,
   ActiveOrderConflict,
+  AppSettingsV22,
   BomMaterialSpec,
   CorridorOrder,
   DepthWalkResult,
@@ -32,6 +35,7 @@ import type {
   MarketCategoryId,
   MarketQuote,
   MarketSnapshot,
+  NpcStandingsMap,
   OrderExecutionMode,
   PilotProfile,
   RouteChain,
@@ -77,33 +81,69 @@ export function getSalesTaxRate(accountingLevel: number): number {
 
 export function getBrokerFeeRate(
   brokerLevel: number,
-  executionMode: OrderExecutionMode = 'list_orders'
+  executionMode: OrderExecutionMode = 'list_orders',
+  options?: {
+    hubId?: TradeHubId;
+    standings?: NpcStandingsMap;
+    appSettings?: AppSettingsV22;
+  }
 ): number {
-  // Exact EVE NPC station formula: 3.0% - (0.3% * BrokerRelationsLevel)
-  // Level 0 = 3.00%, Level V = 1.50% when placing limit orders; 0% on Instant Fill
   if (executionMode === 'instant_fill') return 0;
+  if (options?.hubId || options?.standings || options?.appSettings) {
+    const res = computeExactHubBrokerFee({
+      hubId: options.hubId ?? 'jita',
+      brokerRelationsLvl: brokerLevel,
+      standings: options.standings,
+      useCustomUpwellBroker: options.appSettings?.useCustomUpwellBroker ?? false,
+      customUpwellBrokerPct: options.appSettings?.customUpwellBrokerPct ?? 0.5,
+      includeSccSurcharge: options.appSettings?.includeSccSurcharge ?? true,
+    });
+    return res.effectiveTotalBrokerPct / 100;
+  }
+  // Standard NPC fallback: 3.0% - (0.3% * BrokerRelationsLevel), min 1.0%
   const lvl = Math.max(0, Math.min(5, Math.floor(brokerLevel)));
-  return Math.max(0, 0.03 - 0.003 * lvl);
+  return Math.max(0.01, 0.03 - 0.003 * lvl);
 }
 
-export function getEffectiveOrderFees(profile: PilotProfile): {
+export function getEffectiveOrderFees(
+  profile: PilotProfile,
+  options?: {
+    hubId?: TradeHubId;
+    appSettings?: AppSettingsV22;
+    executionModeOverride?: OrderExecutionMode;
+  }
+): {
   executionMode: OrderExecutionMode;
   salesTaxRate: number;
   brokerFeeRate: number;
   totalSellFeeRate: number;
   salesTaxPct: number;
   brokerFeePct: number;
+  standingBrokerNote: string;
 } {
-  const executionMode: OrderExecutionMode = profile.orderExecutionMode ?? 'list_orders';
+  const executionMode: OrderExecutionMode =
+    options?.executionModeOverride ?? profile.orderExecutionMode ?? 'list_orders';
   const salesTaxRate = getSalesTaxRate(profile.skills.accounting);
-  const brokerFeeRate = getBrokerFeeRate(profile.skills.brokerRelations, executionMode);
+  const feeDetail = computeExactHubBrokerFee({
+    hubId: options?.hubId ?? 'jita',
+    brokerRelationsLvl: profile.skills.brokerRelations,
+    standings: profile.npcStandings,
+    useCustomUpwellBroker: options?.appSettings?.useCustomUpwellBroker ?? false,
+    customUpwellBrokerPct: options?.appSettings?.customUpwellBrokerPct ?? 0.5,
+    includeSccSurcharge: options?.appSettings?.includeSccSurcharge ?? true,
+  });
+  const brokerFeeRate = executionMode === 'instant_fill' ? 0 : feeDetail.effectiveTotalBrokerPct / 100;
+  const note = feeDetail.usingUpwellCustom
+    ? `Upwell Custom ${feeDetail.upwellBrokerPct.toFixed(2)}%${feeDetail.sccSurchargePct > 0 ? ` + ${feeDetail.sccSurchargePct.toFixed(2)}% SCC` : ''} = ${feeDetail.effectiveTotalBrokerPct.toFixed(2)}%`
+    : `${feeDetail.hubName} NPC: 3.0% - ${feeDetail.skillReductionPct.toFixed(2)}% (BR Lv.${feeDetail.brokerRelationsLvl}) - ${feeDetail.factionReductionPct.toFixed(2)}% (${feeDetail.factionName} ${feeDetail.factionStanding}) - ${feeDetail.corpReductionPct.toFixed(2)}% (${feeDetail.corpName} ${feeDetail.corpStanding}) = ${feeDetail.effectiveNpcBrokerPct.toFixed(2)}%`;
   return {
     executionMode,
     salesTaxRate,
     brokerFeeRate,
     totalSellFeeRate: salesTaxRate + brokerFeeRate,
     salesTaxPct: Number((salesTaxRate * 100).toFixed(3)),
-    brokerFeePct: Number((brokerFeeRate * 100).toFixed(2)),
+    brokerFeePct: Number((brokerFeeRate * 100).toFixed(3)),
+    standingBrokerNote: executionMode === 'instant_fill' ? 'Instant Fill (0% Broker)' : note,
   };
 }
 
@@ -2230,6 +2270,7 @@ export function runAllDecisionEngines(
     destHub?: TradeHubId;
     structureConfig?: IndustryStructureConfig;
     industryCosts?: IndustryCostSnapshot;
+    appSettings?: AppSettingsV22;
   }
 ): EngineBundle {
   const checkedSet = new Set(checkedCategories);
@@ -2271,10 +2312,73 @@ export function runAllDecisionEngines(
   );
   const pi = computePiFactoryEvaluator(checkedSet, snapshot, profile);
 
-  const cards = attachActiveOrderConflicts(
+  const rawCards = attachActiveOrderConflicts(
     [...indy.cards, ...reproc, ...corridor, ...trade, ...pi],
     profile.activeOrders
   );
+
+  // Enrich every card with v2.2.0 standing-adjusted broker fee telemetry, multi-period trend ribbon, and universal Qty override support
+  const cards = rawCards.map((card) => {
+    const destHubId: TradeHubId =
+      card.destHubId ??
+      resolveHubIdFromSystemOrRegion(
+        card.routeChains?.[0]?.legs.find((l) => l.action === 'sell')?.systemId,
+        card.destinationRegionId
+      );
+
+    const exactFees = getEffectiveOrderFees(profile, {
+      hubId: destHubId,
+      appSettings: options?.appSettings,
+      executionModeOverride: card.executionMode,
+    });
+
+    // Adjust net profit delta when exact NPC standing / Upwell+SCC broker rate differs from baseline skill-only broker rate
+    const baselineBrokerRate = card.brokerFeePct / 100;
+    const brokerDeltaRate = exactFees.brokerFeeRate - baselineBrokerRate;
+    const feeDeltaIsk =
+      card.executionMode === 'list_orders' && card.grossRevenueIsk > 0
+        ? card.grossRevenueIsk * brokerDeltaRate
+        : 0;
+    const adjustedNetProfit = card.netProfitIsk - feeDeltaIsk;
+    const adjustedMarginPct =
+      card.grossRevenueIsk > 0 ? (adjustedNetProfit / card.grossRevenueIsk) * 100 : card.netMarginPct;
+    const adjustedRoiPct =
+      card.requiredCapitalIsk > 0 ? (adjustedNetProfit / card.requiredCapitalIsk) * 100 : card.roiPct;
+    const adjustedPerUnit =
+      card.outputUnits > 0 ? adjustedNetProfit / card.outputUnits : card.perUnitNetProfitIsk;
+
+    const quote = card.primaryTypeId ? snapshot.quotes[card.primaryTypeId] : undefined;
+    const hubQ = quote ? getHubQuote(quote, destHubId, card.primaryTypeId ? ITEM_BY_ID[card.primaryTypeId] : undefined) : undefined;
+    const trend = deriveQuickMultiPeriodTrend(card.primaryTypeId ?? 34, hubQ);
+
+    return {
+      ...card,
+      destHubId,
+      brokerFeePct: exactFees.brokerFeePct,
+      standingBrokerNote: exactFees.standingBrokerNote,
+      netProfitIsk: adjustedNetProfit,
+      netMarginPct: adjustedMarginPct,
+      roiPct: adjustedRoiPct,
+      perUnitNetProfitIsk: adjustedPerUnit,
+      buyAllProfitIsk:
+        typeof card.buyAllProfitIsk === 'number'
+          ? card.buyAllProfitIsk - feeDeltaIsk
+          : adjustedNetProfit,
+      buyMissingProfitIsk:
+        typeof card.buyMissingProfitIsk === 'number'
+          ? card.buyMissingProfitIsk - feeDeltaIsk
+          : card.buyMissingProfitIsk,
+      isEditableQty: true,
+      baseBatchQty: Math.max(1, Math.round(card.baseBatchQty ?? card.outputUnits ?? 1)),
+      optimalProfitableQty: Math.max(
+        1,
+        Math.round(card.optimalProfitableQty ?? card.baseBatchQty ?? card.outputUnits ?? 1)
+      ),
+      qtyUnitLabel:
+        card.qtyUnitLabel ?? (card.engine === 'indy_invention' ? 'runs' : 'units'),
+      multiPeriodTrend: trend,
+    };
+  });
 
   const shoppingListTotalIsk = indy.shoppingList.reduce((s, l) => s + l.totalCostJita, 0);
   const shoppingListTotalM3 = indy.shoppingList.reduce((s, l) => s + l.volumeM3, 0);

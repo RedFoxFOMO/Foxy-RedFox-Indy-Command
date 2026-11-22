@@ -431,6 +431,8 @@ export interface PilotProfile {
   industryJobs?: CharacterIndustryJob[];
   industryJobsSyncedAt?: string;
   hangarStock?: Record<number, HangarStockEntry>;
+  npcStandings?: NpcStandingsMap;
+  stationAssetsByLocation?: Record<number, Record<number, number>>;
 }
 
 export type EngineId =
@@ -461,7 +463,7 @@ export interface InspectionPayload {
   secondaryRows?: InspectionRow[];
 }
 
-export type RoutingPreference = 'Safer' | 'Shorter';
+export type RoutingPreference = 'Safer' | 'Shorter' | 'LessSecure';
 
 export interface RouteItemSpec {
   typeId?: number;
@@ -850,6 +852,12 @@ export interface ActionCardData {
   hangarSavingsIsk?: number;
   sourceHubId?: TradeHubId;
   destHubId?: TradeHubId;
+  // v2.2.0 Transport Cost, Min Profit Headroom, Multi-Period Trends & Standing Fees
+  transportCostIsk?: number;
+  minDesiredProfitIsk?: number;
+  haulCostOverrideIsk?: number | null;
+  standingBrokerNote?: string;
+  multiPeriodTrend?: MultiPeriodTrend;
 }
 
 export interface MarketHistoryDay {
@@ -1044,3 +1052,298 @@ export interface ChatMessage {
   actions?: AdvisorAction[];
   error?: boolean;
 }
+
+// --- v2.2.0 Types ---
+
+export type PriceTrendPeriod = '30d' | '14d' | '7d' | '1d';
+
+export interface NpcStandingsMap {
+  factions: Record<number, number>;
+  corps: Record<number, number>;
+  hasScope: boolean;
+  syncedAt?: string;
+}
+
+export type RefiningLocationRule = 'same_station' | 'within_x_jumps' | 'specific_hub';
+export type RefiningSellRule = 'same_as_refine' | 'back_at_buy' | 'within_y_jumps';
+
+export interface AppSettingsV22 {
+  tooltipsEnabled: boolean;
+  priceTrendPeriod: PriceTrendPeriod;
+  discordWebhookUrl: string;
+  sharePasteUrl: string;
+  maintainerContactName: string;
+  maintainerCorpName: string;
+  manualJumpCadenceSec: number;
+  defaultRoutingPreference: RoutingPreference;
+  useCustomUpwellBroker: boolean;
+  customUpwellBrokerPct: number;
+  includeSccSurcharge: boolean;
+  refiningLocationRule: RefiningLocationRule;
+  refiningMaxJumps: number;
+  refiningHubId: TradeHubId;
+  refiningSellRule: RefiningSellRule;
+  refiningSellMaxJumps: number;
+}
+
+export interface MultiPeriodTrend {
+  change30dPct: number;
+  change14dPct: number;
+  change7dPct: number;
+  change1dPct: number;
+  sparkline5m: number[];
+  currentPrice: number;
+}
+
+// --- Contracts Tab (Courier + Item / BPC) ---
+
+export interface PublicContractItem {
+  recordId: number;
+  typeId: number;
+  name: string;
+  quantity: number;
+  isIncluded: boolean;
+  isBlueprintCopy?: boolean;
+  materialEfficiency?: number;
+  timeEfficiency?: number;
+  runs?: number;
+  unitVolumeM3?: number;
+}
+
+export interface RawPublicContract {
+  contract_id: number;
+  type: 'courier' | 'item_exchange' | 'auction' | 'loan' | 'unknown';
+  title?: string;
+  price?: number;
+  reward?: number;
+  collateral?: number;
+  volume?: number;
+  start_location_id?: number;
+  end_location_id?: number;
+  start_system_id?: number;
+  start_system_name?: string;
+  end_system_id?: number;
+  end_system_name?: string;
+  start_station_name?: string;
+  end_station_name?: string;
+  days_to_complete?: number;
+  date_issued?: string;
+  date_expired?: string;
+  issuer_id?: number;
+  items?: PublicContractItem[];
+}
+
+export type CollateralClassification =
+  | 'under_valued'
+  | 'fair'
+  | 'over_valued'
+  | 'bait_scam';
+
+export interface EvaluatedCourierContract {
+  contractId: number;
+  title: string;
+  regionId: number;
+  regionName: string;
+  startSystemId: number;
+  startSystemName: string;
+  startStationName: string;
+  endSystemId: number;
+  endSystemName: string;
+  endStationName: string;
+  volumeM3: number;
+  rewardIsk: number;
+  collateralIsk: number;
+  trueContentValueIsk: number;
+  collateralCoveragePct: number;
+  collateralDeltaIsk: number;
+  classification: CollateralClassification;
+  classificationLabel: string;
+  approachJumps: number;
+  jobJumps: number;
+  returnJumps: number;
+  totalJumps: number;
+  approachTimeSec: number;
+  jobTimeSec: number;
+  returnTimeSec: number;
+  totalTimeSec: number;
+  iskPerJump: number;
+  incomePerJobHrIsk: number;
+  incomePerTotalHrIsk: number;
+  netProfitIsk: number;
+  profitPct: number;
+  items: PublicContractItem[];
+  dateExpired?: string;
+}
+
+export interface BpcAllocationRow {
+  typeId: number;
+  blueprintName: string;
+  productTypeId: number;
+  productName: string;
+  runs: number;
+  me: number;
+  te: number;
+  fullBuildCostIsk: number;
+  outputInstantRevIsk: number;
+  grossBuiltMarginIsk: number;
+  allocatedContractShareIsk: number;
+  residualProfitIsk: number;
+}
+
+export interface EvaluatedItemBpcContract {
+  contractId: number;
+  title: string;
+  regionId: number;
+  regionName: string;
+  stationName: string;
+  systemName: string;
+  contractPriceIsk: number;
+  volumeM3: number;
+  instantSaleValueIsk: number;
+  sellOrderValueIsk: number;
+  reprocessValueIsk: number;
+  reprocessBestMode: 'instant' | 'sell_order';
+  bpcBuiltValueIsk: number;
+  bpcBuildCostIsk: number;
+  bpcResidualProfitIsk: number;
+  bpcAllocations: BpcAllocationRow[];
+  bestStrategy: 'instant_sale' | 'sell_order' | 'reprocess' | 'build_bpc';
+  bestValueIsk: number;
+  netProfitIsk: number;
+  profitPct: number;
+  valuationBadge: 'under_valued' | 'fair' | 'over_priced';
+  valuationDeltaIsk: number;
+  valuationDeltaPct: number;
+  items: PublicContractItem[];
+  hasBpc: boolean;
+  dateExpired?: string;
+}
+
+// --- Station Trading Tab ---
+
+export type StationTradeStrategy = 'std_margin' | 'insta_flip' | 'hybrid';
+
+export interface StationTradeOpportunity {
+  typeId: number;
+  name: string;
+  category: MarketCategoryId;
+  hubId: TradeHubId;
+  hubName: string;
+  systemName: string;
+  stationName: string;
+  bestBuyPrice: number;
+  bestSellPrice: number;
+  unitVolumeM3: number;
+  dailyVolume: number;
+  recommendedQty: number;
+  capitalRequiredIsk: number;
+  stdMarginProfitIsk: number;
+  stdMarginRoiPct: number;
+  stdDaysToSell: number;
+  instaFlipProfitIsk: number;
+  instaFlipRoiPct: number;
+  hybridProfitIsk: number;
+  hybridRoiPct: number;
+  bestStrategy: StationTradeStrategy;
+  bestProfitIsk: number;
+  bestRoiPct: number;
+  stationStockQty: number;
+  stationStockMarketValueIsk: number;
+  rangeJumps: 0 | 1 | 2 | 3;
+  trend: MultiPeriodTrend;
+}
+
+// --- Route Lifecycle Tiers ---
+
+export type RouteLifecycleTier = 'live' | 'committed' | 'completed';
+
+export interface SavedRouteRecord {
+  id: string;
+  name: string;
+  createdAt: string;
+  completedAt?: string;
+  tier: 'committed' | 'completed';
+  cardIds: string[];
+  cardTitles: string[];
+  stopCount: number;
+  totalJumps: number;
+  totalVolumeM3: number;
+  totalCapitalIsk: number;
+  totalNetProfitIsk: number;
+  haulCostOverrideIsk?: number | null;
+  multibuySummary: string;
+  notes?: string;
+}
+
+// --- Refining Per-Output Destination Selection ---
+
+export interface PerOutputDestinationOption {
+  outputTypeId: number;
+  outputName: string;
+  qty: number;
+  baseDestHubId: TradeHubId;
+  baseDestName: string;
+  baseNetIsk: number;
+  altDestHubId: TradeHubId;
+  altDestName: string;
+  altNetIsk: number;
+  extraGainIsk: number;
+  extraJumps: number;
+  lockedDestHubId: TradeHubId;
+}
+
+// --- Gank Tab (Threat vs. Target / Victim Evaluator) ---
+
+export type PilotPosture = 'ganker_threat' | 'victim_target' | 'mixed_unknown';
+
+export interface GankHullStats {
+  id: string;
+  name: string;
+  hullClass: string;
+  ehp: number;
+  dps: number;
+  alphaDps: number;
+  maxSpeedMs: number;
+  alignSec: number;
+  sigRadiusM: number;
+  cargoM3: number;
+  hullAndFitIsk: number;
+  resists: { em: number; thermal: number; kinetic: number; explosive: number };
+  optimalRangeKm: number;
+  trackingRadS: number;
+  overloadModules: string[];
+}
+
+export interface GankPilotIntel {
+  characterId?: number;
+  characterName: string;
+  corporationName?: string;
+  securityStatus?: number;
+  posture: PilotPosture;
+  shipsDestroyed: number;
+  shipsLost: number;
+  dangerRatio: number; // 0..100
+  gangRatio: number; // 0..100
+  recentKillsCount?: number;
+  topUsedShip?: string;
+  source: 'zkill_live' | 'esi_only' | 'manual_preset';
+  summary: string;
+}
+
+export interface GankEvaluationResult {
+  recommendation: 'FIGHT' | 'EVADE';
+  confidenceLabel: string;
+  optimalSpeedMs: number;
+  optimalAngularRadS: number;
+  optimalOrbitKm: number;
+  recommendedDamageType: 'EM' | 'Thermal' | 'Kinetic' | 'Explosive';
+  weakestResistPct: number;
+  modulesToOverload: string[];
+  ttkTargetSec: number;
+  timeToBeKilledSec: number;
+  expectedLootDropIsk: number;
+  ownShipRiskIsk: number;
+  netExpectedValueIsk: number;
+  tacticalNotes: string[];
+}
+

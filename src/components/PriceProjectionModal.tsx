@@ -85,7 +85,8 @@ export const PriceProjectionModal: React.FC<PriceProjectionModalProps> = ({
       } catch {
         try {
           const esiRes = await fetch(
-            `https://esi.evetech.net/latest/markets/${regionId}/history/?datasource=tranquility&type_id=${target.typeId}`
+            `https://esi.evetech.net/markets/${regionId}/history/?datasource=tranquility&type_id=${target.typeId}`,
+            { headers: { Accept: 'application/json', 'X-Compatibility-Date': '2026-08-18' } }
           );
           if (!esiRes.ok) throw new Error(`ESI HTTP ${esiRes.status}`);
           const raw = (await esiRes.json()) as MarketHistoryDay[];

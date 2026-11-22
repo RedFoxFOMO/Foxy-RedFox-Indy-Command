@@ -1,19 +1,25 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import {
   AlertTriangle,
+  Archive,
+  BookmarkCheck,
   Bot,
   Check,
   CheckSquare,
   Compass,
   Copy,
+  Download,
   ExternalLink,
   Flame,
   Map as MapIcon,
   MapPin,
   Navigation,
   PanelRightClose,
+  Printer,
   RefreshCw,
+  RotateCcw,
   Send,
+  Share2,
   ShieldAlert,
   ShieldCheck,
   Ship,
@@ -28,14 +34,19 @@ import {
   evaluateHullForCargo,
   recommendBestHullFromFleet,
 } from '../data/eveFleetCatalog.ts';
-import { formatIsk, formatM3 } from '../engines/decisionEngines.ts';
+import { formatIsk, formatM3, getHubQuote } from '../engines/decisionEngines.ts';
+import { getDotlanMultiRouteUrl, resolveHubIdFromSystemOrRegion } from '../utils/dotlan.ts';
+import { buildDepthAwareOrderLines } from '../utils/v22Engines.ts';
 import type {
   ActionCardData,
+  AppSettingsV22,
   AutoFillLoopSummary,
   EndHubTarget,
   HangarHull,
+  MarketSnapshot,
   OptimizedRouteResult,
   RoutingPreference,
+  SavedRouteRecord,
 } from '../types/eve.ts';
 import {
   KNOWN_EVE_SYSTEMS,
@@ -59,6 +70,17 @@ type EndHubChoice =
 interface RouteOptimizerSidebarProps {
   queuedCards: ActionCardData[];
   allCandidateCards: ActionCardData[];
+  snapshot?: MarketSnapshot;
+  appSettings?: AppSettingsV22;
+  savedRoutes?: SavedRouteRecord[];
+  onSaveCommittedRoute?: (record: SavedRouteRecord) => void;
+  onMarkRouteCompleted?: (id: string) => void;
+  onDeleteSavedRoute?: (id: string) => void;
+  onRestoreRoute?: (record: SavedRouteRecord) => void;
+  cardTransportMap?: Record<string, { transportIsk: number; minDesiredProfitIsk: number }>;
+  haulOverrides?: Record<string, number>;
+  onSetHaulOverride?: (cardId: string, haulCostIsk: number) => void;
+  onClearHaulOverride?: (cardId: string) => void;
   pilotSystemId: number;
   pilotSystemName: string;
   pilotStationId?: number;
@@ -88,6 +110,17 @@ const EMPTY_INTEL: RouteIntelMatrix = {
 export function RouteOptimizerSidebar({
   queuedCards,
   allCandidateCards,
+  snapshot,
+  appSettings,
+  savedRoutes = [],
+  onSaveCommittedRoute,
+  onMarkRouteCompleted,
+  onDeleteSavedRoute,
+  onRestoreRoute,
+  cardTransportMap = {},
+  haulOverrides = {},
+  onSetHaulOverride,
+  onClearHaulOverride,
   pilotSystemId,
   pilotSystemName,
   pilotStationId,
@@ -107,6 +140,11 @@ export function RouteOptimizerSidebar({
   onOpenSsoSettings,
   onCollapse,
 }: RouteOptimizerSidebarProps) {
+  const [lifecycleTab, setLifecycleTab] = useState<'live' | 'committed' | 'completed'>('live');
+  const [commitRouteName, setCommitRouteName] = useState('');
+  const [depthAwareCopy, setDepthAwareCopy] = useState(true);
+  const [exportingDiscord, setExportingDiscord] = useState(false);
+
   // Manual starting hub override (null => live connected EVE character ESI location)
   const [overrideSystem, setOverrideSystem] = useState<{
     systemId: number;
@@ -161,10 +199,26 @@ export function RouteOptimizerSidebar({
 
   const handleCopyStopMultibuy = async (
     stopKey: string,
-    buys: { name: string; quantity: number }[]
+    buys: { typeId?: number; name: string; quantity: number }[],
+    stopSystemId?: number
   ) => {
-    const { text, itemCount } = formatEveMultibuyText(buys);
-    if (itemCount === 0) return;
+    let text = '';
+    let itemCount = buys.length;
+    if (depthAwareCopy && snapshot) {
+      const hubId = resolveHubIdFromSystemOrRegion(stopSystemId);
+      const splitRes = buildDepthAwareOrderLines(
+        buys.map((b) => ({ typeId: b.typeId, name: b.name, quantity: b.quantity, side: 'buy' as const })),
+        snapshot,
+        hubId
+      );
+      text = splitRes.eveMultibuyText;
+      itemCount = splitRes.lines.length;
+    } else {
+      const res = formatEveMultibuyText(buys);
+      text = res.text;
+      itemCount = res.itemCount;
+    }
+    if (!text || itemCount === 0) return;
     const ok = await copyTextToClipboard(text);
     if (!ok) {
       showToast('error', 'Clipboard access was blocked by the browser.');
@@ -753,10 +807,187 @@ export function RouteOptimizerSidebar({
     [allCandidateCards]
   );
 
+  const totalHaulCostDeductionIsk = useMemo(() => {
+    return queuedCards.reduce((sum, c) => {
+      const ov = haulOverrides[c.id];
+      if (typeof ov === 'number' && ov >= 0) return sum + ov;
+      const cardT = cardTransportMap[c.id]?.transportIsk ?? 0;
+      return sum + Math.max(0, cardT);
+    }, 0);
+  }, [queuedCards, haulOverrides, cardTransportMap]);
+
+  const netProfitAfterHaulIsk = optimized.totalNetProfitIsk - totalHaulCostDeductionIsk;
+
+  const dotlanMultiUrl = useMemo(() => {
+    const seq = [originSystemName, ...optimized.stops.map((s) => s.systemName)];
+    if (optimized.returnLegSystemName) seq.push(optimized.returnLegSystemName);
+    return getDotlanMultiRouteUrl(seq);
+  }, [originSystemName, optimized.stops, optimized.returnLegSystemName]);
+
+  const committedRoutes = useMemo(
+    () => savedRoutes.filter((r) => r.tier === 'committed'),
+    [savedRoutes]
+  );
+  const completedRoutes = useMemo(
+    () => savedRoutes.filter((r) => r.tier === 'completed'),
+    [savedRoutes]
+  );
+  const archiveTotalProfit = useMemo(
+    () => completedRoutes.reduce((s, r) => s + r.totalNetProfitIsk, 0),
+    [completedRoutes]
+  );
+
+  const buildRouteExportText = () => {
+    const lines: string[] = [
+      `FOXY REDFOX INDY COMMAND v2.2.0 — ROUTE MANIFEST`,
+      `Origin: ${originSystemName} | Stops: ${optimized.stops.length} | Jumps: ${optimized.totalJumps} (${preference})`,
+      `Hull: ${activeHull?.name || 'Auto'} | Peak Cargo: ${formatM3(optimized.peakCargoM3)} | Peak Value: ${formatIsk(optimized.peakCargoIsk)}`,
+      `Buy Capital: ${formatIsk(optimized.totalBuyIsk)} | Net Profit (after haul): ${formatIsk(netProfitAfterHaulIsk)}`,
+      `DOTLAN: ${dotlanMultiUrl}`,
+      '',
+    ];
+    for (const stop of optimized.stops) {
+      lines.push(`STOP ${stop.stopNumber}: ${stop.systemName} (${stop.jumpsFromPrev}j) — ${stop.stationName}`);
+      if (stop.hotSystems.length > 0) {
+        lines.push(`  ! HOT: ${stop.hotSystems.map((h) => `${h.systemName} (${h.shipKills}s/${h.podKills}p)`).join(', ')}`);
+      }
+      for (const b of stop.buys) {
+        lines.push(`  BUY  ${b.quantity}x ${b.name} (${formatIsk(b.iskAmount)})`);
+      }
+      for (const s of stop.sells) {
+        lines.push(`  SELL ${s.quantity}x ${s.name} (+${formatIsk(s.iskAmount)})`);
+      }
+    }
+    return lines.join('\n');
+  };
+
+  const buildRouteExportCsv = () => {
+    const header = 'Stop,System,Station,Action,Item,Quantity,ISK,JumpsFromPrev';
+    const rows: string[] = [header];
+    for (const stop of optimized.stops) {
+      for (const b of stop.buys) {
+        rows.push(
+          `${stop.stopNumber},"${stop.systemName}","${stop.stationName.replace(/"/g, '""')}",BUY,"${b.name.replace(/"/g, '""')}",${b.quantity},${Math.round(b.iskAmount)},${stop.jumpsFromPrev}`
+        );
+      }
+      for (const s of stop.sells) {
+        rows.push(
+          `${stop.stopNumber},"${stop.systemName}","${stop.stationName.replace(/"/g, '""')}",SELL,"${s.name.replace(/"/g, '""')}",${s.quantity},${Math.round(s.iskAmount)},${stop.jumpsFromPrev}`
+        );
+      }
+    }
+    return rows.join('\n');
+  };
+
+  const triggerDownload = (filename: string, content: string, mime: string) => {
+    const blob = new Blob([content], { type: mime });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+    showToast('success', `Downloaded ${filename}`);
+  };
+
+  const handleExportClipboard = async (format: 'text' | 'csv') => {
+    const content = format === 'csv' ? buildRouteExportCsv() : buildRouteExportText();
+    const ok = await copyTextToClipboard(content);
+    showToast(ok ? 'success' : 'error', ok ? `Copied route (${format.toUpperCase()}) to clipboard.` : 'Clipboard blocked.');
+  };
+
+  const handleExportSharePayload = async () => {
+    const payload = {
+      app: 'Foxy RedFox Indy Command',
+      version: '2.2.0',
+      origin: originSystemName,
+      jumps: optimized.totalJumps,
+      netProfitIsk: Math.round(netProfitAfterHaulIsk),
+      dotlan: dotlanMultiUrl,
+      stops: optimized.stops.map((s) => ({
+        stop: s.stopNumber,
+        system: s.systemName,
+        station: s.stationName,
+        buys: s.buys.length,
+        sells: s.sells.length,
+      })),
+    };
+    const encoded = btoa(unescape(encodeURIComponent(JSON.stringify(payload))));
+    const base = appSettings?.sharePasteUrl?.trim();
+    const shareText = base && base.startsWith('https://')
+      ? `${base}${base.includes('?') ? '&' : '?'}route=${encoded}`
+      : `${window.location.origin}${window.location.pathname}#route=${encoded}`;
+    const ok = await copyTextToClipboard(shareText);
+    showToast(ok ? 'success' : 'error', ok ? 'Copied shareable route link payload to clipboard.' : 'Clipboard blocked.');
+  };
+
+  const handlePushDiscord = async () => {
+    const webhookUrl = appSettings?.discordWebhookUrl?.trim() || '';
+    if (!webhookUrl) {
+      showToast('warn', 'Add your Discord Channel Webhook URL in Settings -> Connections & APIs first.', true);
+      return;
+    }
+    setExportingDiscord(true);
+    try {
+      const stopSummary = optimized.stops
+        .slice(0, 6)
+        .map((s) => `**#${s.stopNumber} ${s.systemName}** (${s.jumpsFromPrev}j): ${s.buys.length} buy / ${s.sells.length} sell`)
+        .join('\n');
+      const res = await fetch('/api/integrations/discord-webhook', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          webhookUrl,
+          title: `Route Manifest: ${originSystemName} (${optimized.totalJumps}j · ${optimized.stops.length} stops)`,
+          description: `${stopSummary}\n\n[Open Route in DOTLAN](${dotlanMultiUrl})`,
+          fields: [
+            { name: 'Net Profit (After Haul)', value: `${netProfitAfterHaulIsk >= 0 ? '+' : ''}${formatIsk(netProfitAfterHaulIsk)}`, inline: true },
+            { name: 'Buy Capital', value: formatIsk(optimized.totalBuyIsk), inline: true },
+            { name: 'Peak Hold / Value', value: `${formatM3(optimized.peakCargoM3)} · ${formatIsk(optimized.peakCargoIsk)}`, inline: true },
+          ],
+        }),
+      });
+      const json = (await res.json()) as { ok?: boolean; error?: string };
+      if (!res.ok || !json.ok) throw new Error(json.error || `HTTP ${res.status}`);
+      showToast('success', 'Posted Route Manifest embed to Discord channel.');
+    } catch (err) {
+      showToast('error', err instanceof Error ? err.message : 'Discord push failed.');
+    } finally {
+      setExportingDiscord(false);
+    }
+  };
+
+  const handleCommitCurrentRoute = () => {
+    if (!onSaveCommittedRoute || queuedCards.length === 0) return;
+    const label =
+      commitRouteName.trim() ||
+      `${originSystemName} Loop (${optimized.stops.length} stops · ${optimized.totalJumps}j)`;
+    const record: SavedRouteRecord = {
+      id: `rt-${Date.now()}`,
+      name: label,
+      tier: 'committed',
+      createdAt: new Date().toISOString(),
+      stopCount: optimized.stops.length,
+      totalJumps: optimized.totalJumps,
+      totalVolumeM3: optimized.peakCargoM3,
+      totalCapitalIsk: optimized.totalBuyIsk,
+      totalNetProfitIsk: netProfitAfterHaulIsk,
+      cardIds: queuedCards.map((c) => c.id),
+      cardTitles: queuedCards.map((c) => c.title),
+      multibuySummary: `${optimized.stops.length} stops · ${optimized.totalJumps}j from ${originSystemName}`,
+    };
+    onSaveCommittedRoute(record);
+    setCommitRouteName('');
+    setLifecycleTab('committed');
+    showToast('success', `Committed route "${label}" (${new Date().toLocaleTimeString()}).`);
+  };
+
   return (
     <aside
       aria-label="Fleet Logistics, Threat Intel and Autopilot Planner"
-      className="w-full shrink-0 bg-[#0e131b] border-t lg:border-t-0 flex flex-col h-[640px] lg:h-full"
+      className="print-route-area w-full shrink-0 bg-[#0e131b] border-t lg:border-t-0 flex flex-col h-[640px] lg:h-full"
     >
       {/* Sidebar Header + Right-Rail Switcher */}
       <div className="px-4 py-3 border-b border-slate-800/90 flex items-center justify-between gap-2 shrink-0">
@@ -1012,13 +1243,13 @@ export function RouteOptimizerSidebar({
 
           <div>
             <div className="text-[11px] text-slate-400 font-medium mb-1">
-              ESI Routing
+              2026 ESI Route
             </div>
-            <div className="grid grid-cols-2 rounded border border-slate-800 bg-[#0b0e14] p-0.5">
+            <div className="grid grid-cols-3 rounded border border-slate-800 bg-[#0b0e14] p-0.5">
               <button
                 type="button"
                 onClick={() => setPreference('Safer')}
-                className={`py-1 text-xs font-medium rounded transition-colors cursor-pointer ${
+                className={`py-1 text-[11px] font-medium rounded transition-colors cursor-pointer ${
                   preference === 'Safer'
                     ? 'bg-emerald-500/20 text-emerald-300'
                     : 'text-slate-400 hover:text-slate-200'
@@ -1029,13 +1260,25 @@ export function RouteOptimizerSidebar({
               <button
                 type="button"
                 onClick={() => setPreference('Shorter')}
-                className={`py-1 text-xs font-medium rounded transition-colors cursor-pointer ${
+                className={`py-1 text-[11px] font-medium rounded transition-colors cursor-pointer ${
                   preference === 'Shorter'
                     ? 'bg-amber-500/20 text-amber-300'
                     : 'text-slate-400 hover:text-slate-200'
                 }`}
               >
-                Shorter
+                Short
+              </button>
+              <button
+                type="button"
+                onClick={() => setPreference('LessSecure')}
+                title="Prefer Low-Sec / Null-Sec (POST /route preference: LessSecure)"
+                className={`py-1 text-[11px] font-medium rounded transition-colors cursor-pointer ${
+                  preference === 'LessSecure'
+                    ? 'bg-rose-500/20 text-rose-300'
+                    : 'text-slate-400 hover:text-slate-200'
+                }`}
+              >
+                LowSec
               </button>
             </div>
           </div>
@@ -1174,6 +1417,125 @@ export function RouteOptimizerSidebar({
         </div>
       </div>
 
+      {/* Route Lifecycle Tiers Bar (Live Session / Committed / Completed Archive) */}
+      <div className="no-print px-4 py-2 border-b border-slate-800/80 bg-[#0c1118] flex items-center justify-between gap-1.5 shrink-0">
+        <div className="inline-flex rounded border border-slate-800 bg-[#0b0e14] p-0.5 text-[11px]">
+          <button
+            type="button"
+            onClick={() => setLifecycleTab('live')}
+            className={`px-2 py-0.5 rounded font-medium cursor-pointer ${
+              lifecycleTab === 'live' ? 'bg-cyan-500/20 text-cyan-200' : 'text-slate-400 hover:text-slate-200'
+            }`}
+          >
+            Live ({queuedCards.length})
+          </button>
+          <button
+            type="button"
+            onClick={() => setLifecycleTab('committed')}
+            className={`px-2 py-0.5 rounded font-medium cursor-pointer ${
+              lifecycleTab === 'committed' ? 'bg-amber-500/20 text-amber-200' : 'text-slate-400 hover:text-slate-200'
+            }`}
+          >
+            Committed ({committedRoutes.length})
+          </button>
+          <button
+            type="button"
+            onClick={() => setLifecycleTab('completed')}
+            className={`px-2 py-0.5 rounded font-medium cursor-pointer ${
+              lifecycleTab === 'completed' ? 'bg-emerald-500/20 text-emerald-200' : 'text-slate-400 hover:text-slate-200'
+            }`}
+          >
+            Archive ({completedRoutes.length})
+          </button>
+        </div>
+
+        <a
+          href={dotlanMultiUrl}
+          target="_blank"
+          rel="noopener noreferrer"
+          title="Open entire multi-stop route in DOTLAN EveMaps"
+          className="inline-flex items-center gap-1 px-2 py-0.5 rounded border border-slate-800 bg-[#131822] text-[10px] text-slate-300 hover:border-cyan-400/50 hover:text-cyan-200"
+        >
+          <Compass className="w-3 h-3 text-cyan-400" />
+          <span>DOTLAN</span>
+        </a>
+      </div>
+
+      {/* Committed / Completed Archive Sub-Panel */}
+      {lifecycleTab !== 'live' && (
+        <div className="no-print px-4 py-3 border-b border-slate-800/80 bg-[#0d121a] space-y-2 max-h-56 overflow-y-auto shrink-0">
+          {lifecycleTab === 'completed' && (
+            <div className="flex items-center justify-between text-[11px] bg-emerald-500/10 border border-emerald-500/30 rounded px-2.5 py-1.5">
+              <span className="text-emerald-200 font-medium">Completed Ledger ({completedRoutes.length})</span>
+              <span className="font-mono font-semibold text-emerald-300">
+                +{formatIsk(archiveTotalProfit)}
+              </span>
+            </div>
+          )}
+          {(lifecycleTab === 'committed' ? committedRoutes : completedRoutes).length === 0 ? (
+            <div className="text-[11px] text-slate-500 text-center py-2">
+              {lifecycleTab === 'committed'
+                ? 'No committed routes yet. Save your active route below.'
+                : 'No completed archive routes yet.'}
+            </div>
+          ) : (
+            (lifecycleTab === 'committed' ? committedRoutes : completedRoutes).map((rec) => (
+              <div
+                key={rec.id}
+                className="p-2 rounded border border-slate-800 bg-[#131822] text-[11px] space-y-1"
+              >
+                <div className="flex items-center justify-between gap-2">
+                  <span className="font-semibold text-slate-100 truncate">{rec.name}</span>
+                  <span className="font-mono text-emerald-400 shrink-0">
+                    {rec.totalNetProfitIsk >= 0 ? '+' : ''}
+                    {formatIsk(rec.totalNetProfitIsk)}
+                  </span>
+                </div>
+                <div className="flex items-center justify-between text-[10px] text-slate-400 font-mono">
+                  <span>
+                    {new Date(rec.createdAt).toLocaleString()} · {rec.totalJumps}j · {rec.cardIds.length} cards
+                  </span>
+                </div>
+                <div className="flex items-center gap-1.5 pt-1">
+                  {onRestoreRoute && (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        onRestoreRoute(rec);
+                        setLifecycleTab('live');
+                      }}
+                      className="inline-flex items-center gap-1 px-2 py-0.5 rounded border border-cyan-500/40 bg-cyan-500/10 text-cyan-200 hover:bg-cyan-500/20 text-[10px] cursor-pointer"
+                    >
+                      <RotateCcw className="w-2.5 h-2.5" />
+                      <span>Load</span>
+                    </button>
+                  )}
+                  {rec.tier === 'committed' && onMarkRouteCompleted && (
+                    <button
+                      type="button"
+                      onClick={() => onMarkRouteCompleted(rec.id)}
+                      className="inline-flex items-center gap-1 px-2 py-0.5 rounded border border-emerald-500/40 bg-emerald-500/10 text-emerald-200 hover:bg-emerald-500/20 text-[10px] cursor-pointer"
+                    >
+                      <Archive className="w-2.5 h-2.5" />
+                      <span>Mark Completed</span>
+                    </button>
+                  )}
+                  {onDeleteSavedRoute && (
+                    <button
+                      type="button"
+                      onClick={() => onDeleteSavedRoute(rec.id)}
+                      className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded border border-slate-700 text-slate-400 hover:text-rose-300 text-[10px] ml-auto cursor-pointer"
+                    >
+                      <Trash2 className="w-2.5 h-2.5" />
+                    </button>
+                  )}
+                </div>
+              </div>
+            ))
+          )}
+        </div>
+      )}
+
       {/* Totals Strip (Single-Elevation Hairline Bar) */}
       {queuedCards.length > 0 && (
         <div className="grid grid-cols-2 border-b border-slate-800/90 divide-x divide-y divide-slate-800/80 bg-[#0f141d] shrink-0">
@@ -1217,7 +1579,9 @@ export function RouteOptimizerSidebar({
             </div>
           </div>
           <div className="px-3.5 py-2">
-            <div className="text-[10px] text-slate-400">Total Buy Capital</div>
+            <div className="text-[10px] text-slate-400">
+              Buy Capital {totalHaulCostDeductionIsk > 0 ? `(+${formatIsk(totalHaulCostDeductionIsk)} Haul)` : ''}
+            </div>
             <div
               className={`font-mono tabular-nums text-xs font-semibold mt-0.5 ${
                 walletShortfallIsk > 0 ? 'text-rose-400' : 'text-amber-300'
@@ -1227,19 +1591,19 @@ export function RouteOptimizerSidebar({
             </div>
           </div>
           <div className="px-3.5 py-2">
-            <div className="text-[10px] text-slate-400">After-Tax Profit · ISK/Jump</div>
+            <div className="text-[10px] text-slate-400">Net Profit · ISK/Jump</div>
             <div className="font-mono tabular-nums text-xs font-semibold mt-0.5 flex items-center gap-1.5">
               <span
                 className={
-                  optimized.totalNetProfitIsk >= 0 ? 'text-emerald-400' : 'text-rose-400'
+                  netProfitAfterHaulIsk >= 0 ? 'text-emerald-400' : 'text-rose-400'
                 }
               >
-                {optimized.totalNetProfitIsk >= 0 ? '+' : ''}
-                {formatIsk(optimized.totalNetProfitIsk)}
+                {netProfitAfterHaulIsk >= 0 ? '+' : ''}
+                {formatIsk(netProfitAfterHaulIsk)}
               </span>
               <span className="text-slate-600">·</span>
               <span className="text-cyan-300 text-[11px]">
-                {formatIsk(optimized.netIskPerJump)}/j
+                {formatIsk(optimized.totalJumps > 0 ? netProfitAfterHaulIsk / optimized.totalJumps : netProfitAfterHaulIsk)}/j
               </span>
             </div>
           </div>
@@ -1313,11 +1677,11 @@ export function RouteOptimizerSidebar({
           </div>
         ) : (
           <>
-            {/* Queued Cards Roster (one-click remove per card or Clear Route) */}
-            <div className="bg-[#131822] border border-slate-800/90 rounded-lg px-3 py-2 space-y-1.5">
+            {/* Queued Cards Roster + Per-Card Route Haul Cost Override + Commit Route */}
+            <div className="no-print bg-[#131822] border border-slate-800/90 rounded-lg px-3 py-2.5 space-y-2">
               <div className="flex items-center justify-between gap-2 text-[11px]">
                 <span className="font-medium text-slate-300">
-                  Queued Cards ({queuedCards.length})
+                  Queued Cards &amp; Haul Override ({queuedCards.length})
                 </span>
                 <button
                   type="button"
@@ -1328,26 +1692,177 @@ export function RouteOptimizerSidebar({
                   <span>Clear All</span>
                 </button>
               </div>
-              <div className="flex flex-wrap gap-1.5 max-h-24 overflow-y-auto">
-                {queuedCards.map((card) => (
-                  <span
-                    key={card.id}
-                    className="inline-flex items-center gap-1 max-w-full px-2 py-0.5 rounded border border-slate-700/90 bg-[#0b0e14] text-[11px] text-slate-200"
-                  >
-                    <span className="truncate max-w-[180px]" title={card.title}>
-                      {card.title}
-                    </span>
-                    <button
-                      type="button"
-                      onClick={() => onRemoveCard(card.id)}
-                      aria-label={`Remove ${card.title} from route`}
-                      title={`Remove ${card.title} from route`}
-                      className="text-slate-400 hover:text-rose-300 transition-colors shrink-0 cursor-pointer"
+              <div className="space-y-1.5 max-h-36 overflow-y-auto">
+                {queuedCards.map((card) => {
+                  const hasOverride = typeof haulOverrides[card.id] === 'number';
+                  const effectiveHaul = hasOverride
+                    ? haulOverrides[card.id]
+                    : cardTransportMap[card.id]?.transportIsk ?? 0;
+                  return (
+                    <div
+                      key={card.id}
+                      className="flex items-center justify-between gap-2 px-2 py-1 rounded border border-slate-800 bg-[#0b0e14] text-[11px]"
                     >
-                      <X className="w-3 h-3" aria-hidden="true" />
-                    </button>
-                  </span>
-                ))}
+                      <span className="truncate text-slate-200 min-w-0 flex-1" title={card.title}>
+                        {card.title}
+                      </span>
+                      {onSetHaulOverride && (
+                        <div className="flex items-center gap-1 shrink-0">
+                          <span className="text-[10px] text-slate-500">Haul M:</span>
+                          <input
+                            type="number"
+                            min={0}
+                            step={0.5}
+                            value={Number((effectiveHaul / 1_000_000).toFixed(2))}
+                            onChange={(e) =>
+                              onSetHaulOverride(
+                                card.id,
+                                Math.max(0, Number(e.target.value) || 0) * 1_000_000
+                              )
+                            }
+                            title="Route Haul Cost Override (M ISK). Supersedes card transport cost; clearing restores previous value."
+                            className={`w-14 bg-[#131822] border rounded px-1 py-0.5 text-right font-mono text-[10px] ${
+                              hasOverride
+                                ? 'border-amber-400/70 text-amber-200'
+                                : 'border-slate-700 text-slate-300'
+                            }`}
+                          />
+                          {hasOverride && onClearHaulOverride && (
+                            <button
+                              type="button"
+                              onClick={() => onClearHaulOverride(card.id)}
+                              title="Clear Route Override and restore previous card transport cost"
+                              className="text-amber-300 hover:text-amber-200 cursor-pointer"
+                            >
+                              <RotateCcw className="w-3 h-3" />
+                            </button>
+                          )}
+                        </div>
+                      )}
+                      <button
+                        type="button"
+                        onClick={() => onRemoveCard(card.id)}
+                        aria-label={`Remove ${card.title} from route`}
+                        className="text-slate-400 hover:text-rose-300 transition-colors shrink-0 cursor-pointer"
+                      >
+                        <X className="w-3 h-3" aria-hidden="true" />
+                      </button>
+                    </div>
+                  );
+                })}
+              </div>
+
+              {/* Save/Commit Current Route + Export Bar */}
+              {onSaveCommittedRoute && (
+                <div className="flex items-center gap-1.5 pt-1 border-t border-slate-800/80">
+                  <input
+                    type="text"
+                    value={commitRouteName}
+                    onChange={(e) => setCommitRouteName(e.target.value)}
+                    placeholder="Route name to commit..."
+                    className="flex-1 min-w-0 bg-[#0b0e14] border border-slate-800 rounded px-2 py-1 text-[11px] text-slate-100 placeholder:text-slate-500"
+                  />
+                  <button
+                    type="button"
+                    onClick={handleCommitCurrentRoute}
+                    className="inline-flex items-center gap-1 px-2.5 py-1 rounded border border-amber-400/50 bg-amber-500/15 text-amber-200 hover:bg-amber-500/25 text-[11px] font-medium whitespace-nowrap cursor-pointer"
+                  >
+                    <BookmarkCheck className="w-3 h-3" />
+                    <span>Commit</span>
+                  </button>
+                </div>
+              )}
+
+              {/* Export Targets: Clipboard (Text/CSV), File (.txt/.csv/.json), PDF Print, Share Link, Discord Push */}
+              <div className="flex flex-wrap items-center gap-1 pt-1 border-t border-slate-800/80">
+                <button
+                  type="button"
+                  onClick={() => handleExportClipboard('text')}
+                  className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded border border-slate-700 bg-[#0b0e14] text-[10px] text-slate-300 hover:text-cyan-200 cursor-pointer"
+                  title="Copy full route manifest as plain text"
+                >
+                  <Copy className="w-2.5 h-2.5" />
+                  <span>Txt</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => handleExportClipboard('csv')}
+                  className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded border border-slate-700 bg-[#0b0e14] text-[10px] text-slate-300 hover:text-cyan-200 cursor-pointer"
+                  title="Copy route manifest as CSV"
+                >
+                  <Copy className="w-2.5 h-2.5" />
+                  <span>CSV</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => triggerDownload('foxy-route.txt', buildRouteExportText(), 'text/plain')}
+                  className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded border border-slate-700 bg-[#0b0e14] text-[10px] text-slate-300 hover:text-cyan-200 cursor-pointer"
+                  title="Download route .txt file"
+                >
+                  <Download className="w-2.5 h-2.5" />
+                  <span>.txt</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => triggerDownload('foxy-route.csv', buildRouteExportCsv(), 'text/csv')}
+                  className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded border border-slate-700 bg-[#0b0e14] text-[10px] text-slate-300 hover:text-cyan-200 cursor-pointer"
+                  title="Download route .csv file"
+                >
+                  <Download className="w-2.5 h-2.5" />
+                  <span>.csv</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() =>
+                    triggerDownload(
+                      'foxy-route.json',
+                      JSON.stringify({ origin: originSystemName, optimized, haulOverrides }, null, 2),
+                      'application/json'
+                    )
+                  }
+                  className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded border border-slate-700 bg-[#0b0e14] text-[10px] text-slate-300 hover:text-cyan-200 cursor-pointer"
+                  title="Download route .json file"
+                >
+                  <Download className="w-2.5 h-2.5" />
+                  <span>.json</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => window.print()}
+                  className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded border border-slate-700 bg-[#0b0e14] text-[10px] text-slate-300 hover:text-cyan-200 cursor-pointer"
+                  title="Print or Save Route Manifest & Visual Map as PDF"
+                >
+                  <Printer className="w-2.5 h-2.5" />
+                  <span>PDF</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={handleExportSharePayload}
+                  className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded border border-slate-700 bg-[#0b0e14] text-[10px] text-slate-300 hover:text-cyan-200 cursor-pointer"
+                  title="Copy shareable route link payload"
+                >
+                  <Share2 className="w-2.5 h-2.5" />
+                  <span>Share</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={handlePushDiscord}
+                  disabled={exportingDiscord}
+                  className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded border border-indigo-500/45 bg-indigo-500/15 text-[10px] text-indigo-200 hover:bg-indigo-500/25 cursor-pointer disabled:opacity-50"
+                  title="Push route manifest summary to your configured Discord Webhook"
+                >
+                  <Send className="w-2.5 h-2.5" />
+                  <span>{exportingDiscord ? '...' : 'Discord'}</span>
+                </button>
+                <label className="inline-flex items-center gap-1 ml-auto text-[10px] text-slate-400 cursor-pointer">
+                  <input
+                    type="checkbox"
+                    checked={depthAwareCopy}
+                    onChange={(e) => setDepthAwareCopy(e.target.checked)}
+                    className="accent-cyan-400"
+                  />
+                  <span>Depth-Split</span>
+                </label>
               </div>
             </div>
 
@@ -1443,7 +1958,7 @@ export function RouteOptimizerSidebar({
             {/* ISK Gank-Risk Threshold Alert Banner */}
             {overallGankRisk.level !== 'safe' || exceedsRiskCap ? (
               <div
-                className={`px-3.5 py-2.5 rounded-lg border text-[11px] space-y-1 ${
+                className={`print-gank-alert px-3.5 py-2.5 rounded-lg border text-[11px] space-y-1 ${
                   overallGankRisk.level === 'critical' || exceedsRiskCap
                     ? 'bg-rose-500/12 border-rose-500/50 text-rose-200'
                     : 'bg-amber-500/12 border-amber-500/50 text-amber-200'
@@ -1646,8 +2161,12 @@ export function RouteOptimizerSidebar({
                           </div>
                           <button
                             type="button"
-                            onClick={() => handleCopyStopMultibuy(stopCopyKey, stop.buys)}
-                            title="Copy all BUY items for this station as <Item Name><TAB><Quantity> for EVE Online Multibuy"
+                            onClick={() => handleCopyStopMultibuy(stopCopyKey, stop.buys, stop.systemId)}
+                            title={
+                              depthAwareCopy
+                                ? 'Copy Depth-Aware tier-split BUY items for EVE Online Multibuy'
+                                : 'Copy all BUY items for this station as <Item Name><TAB><Quantity> for EVE Online Multibuy'
+                            }
                             className={`inline-flex items-center gap-1 px-2 py-0.5 text-[10px] font-medium rounded border transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
                               isCopiedThisStop
                                 ? 'border-emerald-400/60 bg-emerald-500/20 text-emerald-200'
@@ -1661,8 +2180,10 @@ export function RouteOptimizerSidebar({
                             )}
                             <span>
                               {isCopiedThisStop
-                                ? `Copied ${copiedCount} ${copiedCount === 1 ? 'item' : 'items'} for EVE Multibuy`
-                                : 'Copy for EVE Multibuy'}
+                                ? `Copied ${copiedCount} ${copiedCount === 1 ? 'item' : 'items'} (${depthAwareCopy ? 'Depth-Split' : 'Standard'})`
+                                : depthAwareCopy
+                                  ? 'Copy Depth-Split Multibuy'
+                                  : 'Copy for EVE Multibuy'}
                             </span>
                           </button>
                         </div>

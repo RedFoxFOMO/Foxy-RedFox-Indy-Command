@@ -6,18 +6,20 @@ import {
   ChevronsDownUp,
   ChevronsUpDown,
   KeyRound,
+  RotateCcw,
   Route,
   ScrollText,
-  Settings,
   ShoppingCart,
   Trash2,
 } from 'lucide-react';
+import { AboutInfoPopover } from './components/AboutInfoPopover.tsx';
 import { ActionCard } from './components/ActionCard.tsx';
 import { AdvisorSidebar } from './components/AdvisorSidebar.tsx';
-import { ApiSetupModal } from './components/ApiSetupModal.tsx';
 import { BlueprintLibraryPanel } from './components/BlueprintLibraryPanel.tsx';
 import { BuildQueueAndLedgerPanel } from './components/BuildQueueAndLedgerPanel.tsx';
 import { CategorySkuModal } from './components/CategorySkuModal.tsx';
+import { ContractsTab } from './components/ContractsTab.tsx';
+import { GankTab } from './components/GankTab.tsx';
 import { HaulerFitFlyout } from './components/HaulerFitFlyout.tsx';
 import type { HaulerFlyoutContext } from './components/HaulerFitFlyout.tsx';
 import { IndustryFacilityBar } from './components/IndustryFacilityBar.tsx';
@@ -31,6 +33,8 @@ import { OverviewProfitChart } from './components/OverviewProfitChart.tsx';
 import { PriceProjectionModal } from './components/PriceProjectionModal.tsx';
 import { RouteOptimizerSidebar } from './components/RouteOptimizerSidebar.tsx';
 import { SettingsModal } from './components/SettingsModal.tsx';
+import type { SettingsTabId } from './components/SettingsModal.tsx';
+import { StationTradingTab } from './components/StationTradingTab.tsx';
 import { TopBar } from './components/TopBar.tsx';
 import type { WorkspaceView } from './components/TopBar.tsx';
 import { WatchlistPanel } from './components/WatchlistPanel.tsx';
@@ -54,6 +58,7 @@ import type {
   ActionCardData,
   AdvisorAction,
   AiCommentarySettings,
+  AppSettingsV22,
   AppStateSummary,
   BuildQueueEntry,
   ChatMessage,
@@ -73,6 +78,7 @@ import type {
   OrderExecutionMode,
   OrderMonitorSnapshot,
   PilotProfile,
+  SavedRouteRecord,
   ShoppingListLine,
   TradeHubId,
   WatchlistItem,
@@ -80,11 +86,17 @@ import type {
 import {
   getCurrentCallbackUrl,
   loadAiCommentarySettings,
+  loadAppSettingsV22,
+  loadCardTransportMap,
   loadCustomEveClientId,
   loadCustomGeminiKey,
+  loadSavedRoutesV22,
   saveAiCommentarySettings,
+  saveAppSettingsV22,
+  saveCardTransportMap,
   saveCustomEveClientId,
   saveCustomGeminiKey,
+  saveSavedRoutesV22,
 } from './utils/apiKeys.ts';
 import { setManyCardsCollapsed, useCollapsibleCard } from './utils/collapseStore.ts';
 import {
@@ -281,6 +293,26 @@ export default function App() {
   const [aiSettings, setAiSettings] = useState<AiCommentarySettings>(() =>
     loadAiCommentarySettings()
   );
+  // v2.2.0 Unified App Settings, Route Lifecycle Archive, Per-Card Transport/Haul Overrides,
+  // Per-Card Order vs Instant Overrides, External Pinned Cards (Contracts/Station Trading), and Undo Toast
+  const [appSettings, setAppSettings] = useState<AppSettingsV22>(() => loadAppSettingsV22());
+  const [savedRoutes, setSavedRoutes] = useState<SavedRouteRecord[]>(() => loadSavedRoutesV22());
+  const [cardTransportMap, setCardTransportMap] = useState<
+    Record<string, { transportIsk: number; minDesiredProfitIsk: number }>
+  >(() => loadCardTransportMap());
+  const [haulOverrides, setHaulOverrides] = useState<Record<string, number>>({});
+  const [cardExecModeOverrides, setCardExecModeOverrides] = useState<
+    Record<string, OrderExecutionMode>
+  >({});
+  const [externalPinnedCards, setExternalPinnedCards] = useState<Record<string, ActionCardData>>(
+    {}
+  );
+  const [undoToast, setUndoToast] = useState<{
+    message: string;
+    onUndo?: () => void;
+  } | null>(null);
+  const undoTimerRef = useRef<number | null>(null);
+
   const [rightPanePct, setRightPanePct] = useState<number>(loadStoredRightPanePct);
   const [isDraggingSplit, setIsDraggingSplit] = useState(false);
   const splitContainerRef = useRef<HTMLDivElement | null>(null);
@@ -329,18 +361,11 @@ export default function App() {
   const [showShoppingListDrawer, setShowShoppingListDrawer] = useState(false);
   const [historyTarget, setHistoryTarget] = useState<{ typeId: number; name: string } | null>(null);
   const [settingsOpen, setSettingsOpen] = useState(false);
-  const [settingsInitialTab, setSettingsInitialTab] = useState<'sso' | 'profile' | 'assets'>('sso');
-  const [apiSetupOpen, setApiSetupOpen] = useState(false);
-  const [apiSetupReason, setApiSetupReason] = useState<string | null>(null);
+  const [settingsInitialTab, setSettingsInitialTab] = useState<SettingsTabId>('connections');
 
-  const openSettingsTab = useCallback((tab: 'sso' | 'profile' | 'assets') => {
+  const openSettingsTab = useCallback((tab: SettingsTabId) => {
     setSettingsInitialTab(tab);
     setSettingsOpen(true);
-  }, []);
-
-  const openApiSetupModal = useCallback((reason: string | null = null) => {
-    setApiSetupReason(reason);
-    setApiSetupOpen(true);
   }, []);
 
   const handleOpenHistory = useCallback((typeId: number, name: string) => {
@@ -350,7 +375,6 @@ export default function App() {
   // EVE SSO PKCE, BYOK ("Bring Your Own Keys") & Full Blueprint Scanner state
   const buildEnvEveClientId = (import.meta.env.VITE_EVE_CLIENT_ID || '').trim();
   const [envEveClientId, setEnvEveClientId] = useState<string>(buildEnvEveClientId);
-  const [hasEnvEveClientId, setHasEnvEveClientId] = useState<boolean>(Boolean(buildEnvEveClientId));
   const [hasEnvGeminiKey, setHasEnvGeminiKey] = useState<boolean>(false);
   const [customEveClientId, setCustomEveClientId] = useState<string>(() => loadCustomEveClientId());
   const [customGeminiKey, setCustomGeminiKey] = useState<string>(() => loadCustomGeminiKey());
@@ -398,9 +422,6 @@ export default function App() {
           const serverId = (cfg.serverClientId || '').trim();
           if (serverId) {
             setEnvEveClientId(serverId);
-            setHasEnvEveClientId(true);
-          } else if (typeof cfg.hasEnvEveClientId === 'boolean') {
-            setHasEnvEveClientId(cfg.hasEnvEveClientId || Boolean(buildEnvEveClientId));
           }
           if (typeof cfg.hasEnvGeminiKey === 'boolean') {
             setHasEnvGeminiKey(cfg.hasEnvGeminiKey);
@@ -410,7 +431,7 @@ export default function App() {
       .catch(() => {
         // Static/offline deployment fallback: rely on VITE_* or browser localStorage keys
       });
-  }, [buildEnvEveClientId]);
+  }, []);
 
   // Live 1-second countdown ticker while any ESI cooldown or rate-limit pause is active
   const marketCooldownRemainingSec =
@@ -957,7 +978,143 @@ export default function App() {
   const handleChangeAiSettings = useCallback((next: AiCommentarySettings) => {
     setAiSettings(next);
     saveAiCommentarySettings(next);
+    if (next.geminiKey !== undefined) {
+      setCustomGeminiKey(next.geminiKey);
+      saveCustomGeminiKey(next.geminiKey);
+    }
   }, []);
+
+  // v2.2.0 Settings, Route Archive, Transport/Haul Override, and Undo Toast handlers
+  const handleChangeAppSettings = useCallback((next: AppSettingsV22) => {
+    setAppSettings(next);
+    saveAppSettingsV22(next);
+  }, []);
+
+  useEffect(() => {
+    saveSavedRoutesV22(savedRoutes);
+  }, [savedRoutes]);
+
+  useEffect(() => {
+    saveCardTransportMap(cardTransportMap);
+  }, [cardTransportMap]);
+
+  const triggerUndoToast = useCallback((message: string, onUndo?: () => void) => {
+    setUndoToast({ message, onUndo });
+    if (undoTimerRef.current) window.clearTimeout(undoTimerRef.current);
+    undoTimerRef.current = window.setTimeout(() => {
+      setUndoToast(null);
+      undoTimerRef.current = null;
+    }, 6500);
+  }, []);
+
+  const handleSaveCommittedRoute = useCallback(
+    (record: SavedRouteRecord) => {
+      setSavedRoutes((prev) => [record, ...prev]);
+      triggerUndoToast(`Committed route "${record.name}" to active routes.`);
+    },
+    [triggerUndoToast]
+  );
+
+  const handleMarkRouteCompleted = useCallback(
+    (id: string) => {
+      setSavedRoutes((prev) => {
+        const target = prev.find((r) => r.id === id);
+        if (target) {
+          triggerUndoToast(
+            `Archived "${target.name}" to Completed Routes.`,
+            () =>
+              setSavedRoutes((cur) =>
+                cur.map((r) =>
+                  r.id === id ? { ...r, tier: 'committed', completedAt: undefined } : r
+                )
+              )
+          );
+        }
+        return prev.map((r) =>
+          r.id === id
+            ? { ...r, tier: 'completed', completedAt: new Date().toISOString() }
+            : r
+        );
+      });
+    },
+    [triggerUndoToast]
+  );
+
+  const handleDeleteSavedRoute = useCallback(
+    (id: string) => {
+      setSavedRoutes((prev) => {
+        const target = prev.find((r) => r.id === id);
+        if (target) {
+          triggerUndoToast(`Deleted saved route "${target.name}".`, () =>
+            setSavedRoutes((cur) => [target, ...cur])
+          );
+        }
+        return prev.filter((r) => r.id !== id);
+      });
+    },
+    [triggerUndoToast]
+  );
+
+  const handleRestoreRoute = useCallback(
+    (record: SavedRouteRecord) => {
+      setQueuedRouteIds(record.cardIds);
+      setRightSidebarMode('route');
+      triggerUndoToast(`Loaded "${record.name}" (${record.cardIds.length} cards) into Live Session.`);
+    },
+    [triggerUndoToast]
+  );
+
+  const handleChangeCardTransport = useCallback(
+    (cardId: string, transportIsk: number, minDesiredProfitIsk: number) => {
+      setCardTransportMap((prev) => ({
+        ...prev,
+        [cardId]: {
+          transportIsk: Math.max(0, transportIsk),
+          minDesiredProfitIsk: Math.max(0, minDesiredProfitIsk),
+        },
+      }));
+    },
+    []
+  );
+
+  const handleSetHaulOverride = useCallback((cardId: string, haulCostIsk: number) => {
+    setHaulOverrides((prev) => ({ ...prev, [cardId]: Math.max(0, haulCostIsk) }));
+  }, []);
+
+  const handleClearHaulOverride = useCallback(
+    (cardId: string) => {
+      setHaulOverrides((prev) => {
+        const prevOverride = prev[cardId];
+        if (prevOverride === undefined) return prev;
+        const next = { ...prev };
+        delete next[cardId];
+        const restoredBase = cardTransportMap[cardId]?.transportIsk ?? 0;
+        triggerUndoToast(
+          `Cleared route haul override — restored card transport cost (${formatIsk(restoredBase)}).`,
+          () => setHaulOverrides((cur) => ({ ...cur, [cardId]: prevOverride }))
+        );
+        return next;
+      });
+    },
+    [cardTransportMap, triggerUndoToast]
+  );
+
+  const handleChangeCardExecutionMode = useCallback(
+    (cardId: string, mode: OrderExecutionMode) => {
+      setCardExecModeOverrides((prev) => ({ ...prev, [cardId]: mode }));
+    },
+    []
+  );
+
+  const handlePinExternalCardToRoute = useCallback(
+    (card: ActionCardData) => {
+      setExternalPinnedCards((prev) => ({ ...prev, [card.id]: card }));
+      setQueuedRouteIds((prev) => (prev.includes(card.id) ? prev : [...prev, card.id]));
+      setRightSidebarMode('route');
+      triggerUndoToast(`Pinned "${card.title}" to Route Optimizer.`);
+    },
+    [triggerUndoToast]
+  );
 
   // Resizable vertical split-pane drag handlers (center workspace <-> right docked panel)
   useEffect(() => {
@@ -1006,7 +1163,7 @@ export default function App() {
         const res = await pollUndercutWatchdogClient(
           profile.characterId!,
           eveAccessToken,
-          getEffectiveOrderFees(profile).salesTaxPct / 100
+          getEffectiveOrderFees(profile, { hubId: destHub, appSettings }).salesTaxPct / 100
         );
         if (res.cacheMeta) {
           setCacheTelemetry({
@@ -1180,6 +1337,14 @@ export default function App() {
             charJson.hangarStock && Object.keys(charJson.hangarStock).length > 0
               ? charJson.hangarStock
               : prev.hangarStock,
+          npcStandings: Array.isArray(charJson.npcStandings)
+            ? charJson.npcStandings
+            : prev.npcStandings,
+          stationAssetsByLocation:
+            charJson.stationAssetsByLocation &&
+            Object.keys(charJson.stationAssetsByLocation).length > 0
+              ? charJson.stationAssetsByLocation
+              : prev.stationAssetsByLocation,
           hulls:
             charJson.hulls && charJson.hulls.length > 0 ? charJson.hulls : prev.hulls,
         }));
@@ -1208,14 +1373,6 @@ export default function App() {
     saveCustomEveClientId(val);
   };
 
-  const handleSaveApiKeys = (keys: { eveClientId: string; geminiApiKey: string }) => {
-    setCustomEveClientId(keys.eveClientId);
-    saveCustomEveClientId(keys.eveClientId);
-    setCustomGeminiKey(keys.geminiApiKey);
-    saveCustomGeminiKey(keys.geminiApiKey);
-    setApiSetupReason(null);
-  };
-
   const handleConnectEveSso = async (overrideClientId?: string) => {
     const trimmedId = (
       envEveClientId ||
@@ -1223,11 +1380,10 @@ export default function App() {
     ).trim();
 
     if (!trimmedId) {
-      setSettingsOpen(false);
-      openApiSetupModal(
-        'No EVE Client ID is configured yet. Copy the Callback URL below into developers.eveonline.com, paste your Client ID, and click Save & Connect EVE SSO.'
+      openSettingsTab('connections');
+      setSsoStatusMsg(
+        'No EVE Client ID is configured yet. Copy the Callback URL into developers.eveonline.com, paste your Client ID below, and click Connect EVE SSO.'
       );
-      setSsoStatusMsg('Configure your EVE Developer Application Client ID in API Setup first.');
       return;
     }
 
@@ -1257,12 +1413,6 @@ export default function App() {
         err instanceof Error ? err.message : 'Unable to start PKCE authentication.'
       );
     }
-  };
-
-  const handleSaveAndConnectSso = (keys: { eveClientId: string; geminiApiKey: string }) => {
-    handleSaveApiKeys(keys);
-    setApiSetupOpen(false);
-    void handleConnectEveSso(keys.eveClientId);
   };
 
   const handleSwitchToSimulation = () => {
@@ -1374,7 +1524,23 @@ export default function App() {
     );
   }, []);
 
-  const effectiveFees = useMemo(() => getEffectiveOrderFees(profile), [profile]);
+  const handleApplyExecutionModeToAll = useCallback(
+    (mode: OrderExecutionMode) => {
+      setProfile((prev) =>
+        prev.orderExecutionMode === mode ? prev : { ...prev, orderExecutionMode: mode }
+      );
+      setCardExecModeOverrides({});
+      triggerUndoToast(
+        `Applied ${mode === 'list_orders' ? 'List Orders' : 'Instant Fill'} mode to all action cards.`
+      );
+    },
+    [triggerUndoToast]
+  );
+
+  const effectiveFees = useMemo(
+    () => getEffectiveOrderFees(profile, { hubId: destHub, appSettings }),
+    [appSettings, destHub, profile]
+  );
   const activeSellOrderCount = useMemo(
     () => (profile.activeOrders ?? []).filter((o) => !o.isBuyOrder).length,
     [profile.activeOrders]
@@ -1444,10 +1610,13 @@ export default function App() {
         // Fallback to direct ESI UI trigger
       }
       await fetch(
-        `https://esi.evetech.net/latest/ui/openwindow/marketdetails/?datasource=tranquility&type_id=${typeId}`,
+        `https://esi.evetech.net/ui/openwindow/marketdetails/?datasource=tranquility&type_id=${typeId}`,
         {
           method: 'POST',
-          headers: { Authorization: `Bearer ${eveAccessToken}` },
+          headers: {
+            Authorization: `Bearer ${eveAccessToken}`,
+            'X-Compatibility-Date': '2026-08-18',
+          },
         }
       );
     },
@@ -1464,6 +1633,7 @@ export default function App() {
         destHub,
         structureConfig,
         industryCosts: industryCosts ?? undefined,
+        appSettings,
       }),
     [
       checkedCategories,
@@ -1475,6 +1645,7 @@ export default function App() {
       destHub,
       structureConfig,
       industryCosts,
+      appSettings,
     ]
   );
 
@@ -1608,8 +1779,14 @@ export default function App() {
       case 'pipeline_corridor':
       case 'regional_trade':
         return '5-Hub Trade';
+      case 'station_trading':
+        return 'Station Trading';
+      case 'contracts':
+        return 'Contracts';
       case 'pi_factory':
         return 'PI Factories';
+      case 'gank':
+        return 'Gank';
       default:
         return 'Overview';
     }
@@ -2009,14 +2186,20 @@ export default function App() {
     [qtyOverridesByCardId]
   );
 
-  // Active queued cards derived strictly from queuedRouteIds + live engineBundle.cards + committed slicer quantities
-  const queuedRouteCards = useMemo(
-    () =>
-      engineBundle.cards
-        .filter((c) => queuedRouteIds.includes(c.id))
-        .map(applyCommittedQtyToCard),
-    [engineBundle.cards, queuedRouteIds, applyCommittedQtyToCard]
-  );
+  // Active queued cards derived strictly from queuedRouteIds + live engineBundle.cards + external pinned cards
+  const queuedRouteCards = useMemo(() => {
+    const byId = new Map<string, ActionCardData>();
+    for (const c of engineBundle.cards) byId.set(c.id, c);
+    for (const c of Object.values(externalPinnedCards)) {
+      if (!byId.has(c.id)) byId.set(c.id, c);
+    }
+    const list: ActionCardData[] = [];
+    for (const id of queuedRouteIds) {
+      const found = byId.get(id);
+      if (found) list.push(applyCommittedQtyToCard(found));
+    }
+    return list;
+  }, [engineBundle.cards, externalPinnedCards, queuedRouteIds, applyCommittedQtyToCard]);
   const queuedProfitSum = useMemo(
     () => queuedRouteCards.reduce((s, c) => s + c.netProfitIsk, 0),
     [queuedRouteCards]
@@ -2080,30 +2263,32 @@ export default function App() {
   return (
     <div className="min-h-screen lg:h-screen flex flex-col bg-[#0b0e14] text-slate-100 lg:overflow-hidden">
       {/* Strict 3-Zone Top Navigation Bar */}
-      <TopBar
-        activeView={activeView}
-        onSelectView={setActiveView}
-        orderMonitorOpen={orderMonitorOpen}
-        undercutCount={profile.mode === 'eve_sso' ? (orderMonitorData?.undercutCount ?? 0) : 2}
-        onOpenOrderMonitor={handleOpenOrderMonitor}
-        onSyncMarkets={handleRefreshMarketPrices}
-        isSyncing={isSyncing || scanProgress.active}
-        marketCooldownRemainingSec={marketCooldownRemainingSec}
-        isRateLimitPaused={rateLimitPauseRemainingSec > 0}
-        routePanelOpen={rightSidebarMode === 'route'}
-        queuedRouteCount={queuedRouteCards.length}
-        onToggleRoutePanel={() =>
-          setRightSidebarMode((mode) => (mode === 'route' ? 'collapsed' : 'route'))
-        }
-        onOpenApiSetup={() => openApiSetupModal(null)}
-        hasEveClientId={Boolean(effectiveEveClientId)}
-        cacheTelemetry={cacheTelemetry}
-      />
+      <div className="no-print shrink-0">
+        <TopBar
+          activeView={activeView}
+          onSelectView={setActiveView}
+          orderMonitorOpen={orderMonitorOpen}
+          undercutCount={profile.mode === 'eve_sso' ? (orderMonitorData?.undercutCount ?? 0) : 2}
+          onOpenOrderMonitor={handleOpenOrderMonitor}
+          onSyncMarkets={handleRefreshMarketPrices}
+          isSyncing={isSyncing || scanProgress.active}
+          marketCooldownRemainingSec={marketCooldownRemainingSec}
+          isRateLimitPaused={rateLimitPauseRemainingSec > 0}
+          routePanelOpen={rightSidebarMode === 'route'}
+          queuedRouteCount={queuedRouteCards.length}
+          onToggleRoutePanel={() =>
+            setRightSidebarMode((mode) => (mode === 'route' ? 'collapsed' : 'route'))
+          }
+          onOpenSettings={() => openSettingsTab('connections')}
+          hasEveClientId={Boolean(effectiveEveClientId)}
+          cacheTelemetry={cacheTelemetry}
+        />
+      </div>
 
       {/* Main Resizable Split Command Workspace (Center Workspace + Drag Divider + Right Docked Panel) */}
       <div ref={splitContainerRef} className="flex-1 flex flex-col lg:flex-row min-h-0">
         {/* Main Center Workspace */}
-        <main className="flex-1 min-w-0 lg:overflow-y-auto px-5 py-5 space-y-5">
+        <main className="no-print flex-1 min-w-0 lg:overflow-y-auto px-5 py-5 space-y-5">
           {/* Compact Pilot & Data Freshness Context Ribbon */}
           <div className="flex flex-wrap items-center justify-between gap-3 pb-3 border-b border-slate-800/80">
             <div className="flex flex-wrap items-center gap-x-2.5 gap-y-1 text-xs text-slate-400">
@@ -2145,7 +2330,7 @@ export default function App() {
             <div className="flex flex-wrap items-center gap-2 shrink-0">
               <button
                 type="button"
-                onClick={() => openSettingsTab('assets')}
+                onClick={() => openSettingsTab('industry')}
                 className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-md border border-slate-700/90 bg-[#131822] text-slate-200 hover:border-cyan-400/50 hover:text-cyan-200 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
               >
                 <ScrollText className="w-3.5 h-3.5 text-cyan-400" aria-hidden="true" />
@@ -2172,10 +2357,11 @@ export default function App() {
                 type="button"
                 onClick={() => {
                   if (profile.mode === 'eve_sso') {
-                    openSettingsTab('sso');
+                    openSettingsTab('connections');
                   } else if (!effectiveEveClientId) {
-                    openApiSetupModal(
-                      'No EVE Client ID is configured yet. Copy the Callback URL below into developers.eveonline.com, paste your Client ID, and click Save & Connect EVE SSO.'
+                    openSettingsTab('connections');
+                    setSsoStatusMsg(
+                      'No EVE Client ID is configured yet. Copy the Callback URL into developers.eveonline.com, paste your Client ID below, and click Connect EVE SSO.'
                     );
                   } else {
                     void handleConnectEveSso();
@@ -2187,16 +2373,6 @@ export default function App() {
                 <span>
                   {profile.mode === 'eve_sso' ? 'EVE SSO Connected' : 'Connect EVE SSO'}
                 </span>
-              </button>
-
-              <button
-                type="button"
-                onClick={() => openSettingsTab('profile')}
-                aria-label="Open Pilot Calibration and Tax Settings"
-                className="inline-flex items-center gap-1.5 px-2.5 py-1.5 text-xs font-medium rounded-md border border-slate-800 bg-[#131822] text-slate-300 hover:border-slate-700 hover:text-slate-100 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
-              >
-                <Settings className="w-3.5 h-3.5" aria-hidden="true" />
-                <span>Settings</span>
               </button>
             </div>
           </div>
@@ -2217,6 +2393,34 @@ export default function App() {
             </div>
           )}
 
+          {undoToast && (
+            <div className="px-4 py-2 rounded-md bg-cyan-500/10 border border-cyan-500/35 text-xs text-cyan-100 flex items-center justify-between gap-3">
+              <span>{undoToast.message}</span>
+              <div className="flex items-center gap-2 shrink-0">
+                {undoToast.onUndo && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      undoToast.onUndo?.();
+                      setUndoToast(null);
+                    }}
+                    className="inline-flex items-center gap-1 px-2 py-0.5 rounded border border-cyan-400/50 bg-cyan-500/20 text-cyan-100 hover:bg-cyan-500/30 font-medium cursor-pointer"
+                  >
+                    <RotateCcw className="w-3 h-3" aria-hidden="true" />
+                    <span>Undo</span>
+                  </button>
+                )}
+                <button
+                  type="button"
+                  onClick={() => setUndoToast(null)}
+                  className="text-slate-400 hover:text-slate-200 text-[11px] cursor-pointer"
+                >
+                  Dismiss
+                </button>
+              </div>
+            </div>
+          )}
+
           {snapshot.syncError && (
             <div className="px-4 py-2.5 rounded-md bg-rose-500/10 border border-rose-500/30 text-xs text-rose-200">
               Market sync warning: {snapshot.syncError} — using cached/baseline prices until retry.
@@ -2225,7 +2429,18 @@ export default function App() {
 
           {/* Mobile / Tablet Engine Switcher */}
           <div className="flex lg:hidden items-center gap-1.5 overflow-x-auto pb-1">
-            {(['overview', ...ENGINE_SECTIONS.map((s) => s.id)] as WorkspaceView[]).map((v) => (
+            {(
+              [
+                'overview',
+                'indy_invention',
+                'reprocessing',
+                'corridor_trade',
+                'station_trading',
+                'contracts',
+                'pi_factory',
+                'gank',
+              ] as WorkspaceView[]
+            ).map((v) => (
               <button
                 key={v}
                 type="button"
@@ -2242,11 +2457,15 @@ export default function App() {
                     ? 'Indy & T2'
                     : v === 'reprocessing'
                       ? 'Reprocessing'
-                      : v === 'pipeline_corridor'
-                        ? 'Corridor'
-                        : v === 'regional_trade'
-                          ? 'Jita-Dodixie'
-                          : 'PI Factories'}
+                      : v === 'corridor_trade'
+                        ? '5-Hub Trade'
+                        : v === 'station_trading'
+                          ? 'Station Trading'
+                          : v === 'contracts'
+                            ? 'Contracts'
+                            : v === 'gank'
+                              ? 'Gank'
+                              : 'PI'}
               </button>
             ))}
           </div>
@@ -2404,10 +2623,10 @@ export default function App() {
               </div>
 
               <div className="flex flex-wrap items-center gap-2 shrink-0">
-                {/* Global Skill-Adjusted Tax/Broker Execution Mode Toggle */}
+                {/* Global Skill- & Standing-Adjusted Tax/Broker Execution Mode Toggle ("Apply to All Cards") */}
                 <div
                   className="inline-flex items-center gap-1.5 px-2 py-1 rounded border border-slate-800 bg-[#0b0e14] text-[11px]"
-                  title={`Accounting Lv.${profile.skills.accounting} (Sales Tax ${effectiveFees.salesTaxPct.toFixed(2)}%) · Broker Relations Lv.${profile.skills.brokerRelations} (NPC Broker ${effectiveFees.brokerFeePct.toFixed(2)}%)`}
+                  title={`Accounting Lv.${profile.skills.accounting} (Sales Tax ${effectiveFees.salesTaxPct.toFixed(2)}%) · Broker Relations Lv.${profile.skills.brokerRelations} (Standing-Adjusted Broker ${effectiveFees.brokerFeePct.toFixed(2)}%)`}
                 >
                   <span className="font-mono tabular-nums text-slate-400 hidden sm:inline">
                     Tax {effectiveFees.salesTaxPct.toFixed(2)}% · Broker{' '}
@@ -2416,28 +2635,54 @@ export default function App() {
                   <div className="inline-flex rounded bg-[#131822] p-0.5 border border-slate-800">
                     <button
                       type="button"
-                      onClick={() => handleChangeExecutionMode('list_orders')}
+                      onClick={() => handleApplyExecutionModeToAll('list_orders')}
+                      title="Apply List Orders to all cards (clears per-card overrides)"
                       className={`px-2 py-0.5 text-[11px] font-medium rounded transition-colors cursor-pointer ${
                         effectiveFees.executionMode === 'list_orders'
                           ? 'bg-cyan-500/20 text-cyan-200'
                           : 'text-slate-400 hover:text-slate-200'
                       }`}
                     >
-                      List Orders
+                      All: Orders
                     </button>
                     <button
                       type="button"
-                      onClick={() => handleChangeExecutionMode('instant_fill')}
+                      onClick={() => handleApplyExecutionModeToAll('instant_fill')}
+                      title="Apply Instant Fill to all cards (clears per-card overrides)"
                       className={`px-2 py-0.5 text-[11px] font-medium rounded transition-colors cursor-pointer ${
                         effectiveFees.executionMode === 'instant_fill'
                           ? 'bg-emerald-500/20 text-emerald-200'
                           : 'text-slate-400 hover:text-slate-200'
                       }`}
                     >
-                      Instant Fill
+                      All: Instant
                     </button>
                   </div>
+                  {Object.keys(cardExecModeOverrides).length > 0 && (
+                    <span className="text-[10px] font-mono text-amber-300">
+                      ({Object.keys(cardExecModeOverrides).length} custom)
+                    </span>
+                  )}
                 </div>
+
+                {/* Quick Global Tooltips On/Off Toggle (Locked Info Tips always remain active) */}
+                <button
+                  type="button"
+                  onClick={() =>
+                    handleChangeAppSettings({
+                      ...appSettings,
+                      tooltipsEnabled: !appSettings.tooltipsEnabled,
+                    })
+                  }
+                  title="Toggle general helper tooltips across the app (Locked setup/rule tips stay visible)"
+                  className={`px-2 py-1.5 text-[11px] font-medium rounded border transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
+                    appSettings.tooltipsEnabled
+                      ? 'border-slate-700/90 bg-[#0e131b] text-slate-300 hover:text-slate-100'
+                      : 'border-amber-500/40 bg-amber-500/10 text-amber-200'
+                  }`}
+                >
+                  Tooltips: {appSettings.tooltipsEnabled ? 'On' : 'Off'}
+                </button>
 
                 <button
                   type="button"
@@ -2490,8 +2735,43 @@ export default function App() {
             </section>
           )}
 
-          {/* Empty State if all checkboxes cleared */}
-          {checkedCategories.length === 0 ? (
+          {/* Dedicated v2.2.0 Tabs: Contracts, Station Trading, and Gank Evaluator */}
+          {activeView === 'contracts' ? (
+            <div className="pb-8">
+              <ContractsTab
+                profile={profile}
+                snapshot={snapshot}
+                structureConfig={structureConfig}
+                appSettings={appSettings}
+                eveAccessToken={eveAccessToken}
+                onPinToRoute={handlePinExternalCardToRoute}
+                onOpenSettings={() => openSettingsTab('connections')}
+              />
+            </div>
+          ) : activeView === 'gank' ? (
+            <div className="pb-8">
+              <GankTab profile={profile} snapshot={snapshot} appSettings={appSettings} />
+            </div>
+          ) : activeView === 'station_trading' ? (
+            <div className="pb-8">
+              <StationTradingTab
+                profile={profile}
+                snapshot={snapshot}
+                checkedCategories={checkedCategories}
+                appSettings={appSettings}
+                eveAccessToken={eveAccessToken}
+                onPinToRoute={handlePinExternalCardToRoute}
+                onInspectCard={(c) => {
+                  setShowShoppingListDrawer(false);
+                  setInspectedCard(c);
+                }}
+                onOpenProjection={(typeId, itemName, regionId) =>
+                  setPriceProjectionTarget({ typeId, itemName, regionId })
+                }
+                onOpenSettings={() => openSettingsTab('connections')}
+              />
+            </div>
+          ) : checkedCategories.length === 0 ? (
             <div className="bg-[#131822] border border-slate-800/90 rounded-lg p-10 text-center space-y-3">
               <h2 className="font-display text-lg font-semibold text-slate-100">
                 No Market Scope Categories Selected
@@ -2653,6 +2933,7 @@ export default function App() {
                             rank={idx + 1}
                             profile={profile}
                             eveAccessToken={eveAccessToken}
+                            appSettings={appSettings}
                             isQueuedForRoute={queuedRouteIds.includes(card.id)}
                             isPinnedToWatchlist={
                               card.primaryTypeId
@@ -2661,6 +2942,16 @@ export default function App() {
                             }
                             committedQty={qtyOverridesByCardId[card.id]}
                             onCommitQty={handleCommitCardQty}
+                            cardExecutionModeOverride={cardExecModeOverrides[card.id]}
+                            onChangeCardExecutionMode={handleChangeCardExecutionMode}
+                            cardTransportCostIsk={cardTransportMap[card.id]?.transportIsk}
+                            cardMinDesiredProfitIsk={
+                              cardTransportMap[card.id]?.minDesiredProfitIsk
+                            }
+                            haulCostOverrideIsk={
+                              haulOverrides[card.id] !== undefined ? haulOverrides[card.id] : null
+                            }
+                            onChangeCardTransport={handleChangeCardTransport}
                             isSelected={selectedCardId === card.id}
                             onSelectCard={setSelectedCardId}
                             snapshot={snapshot}
@@ -2679,7 +2970,7 @@ export default function App() {
                             }}
                             onAskAdvisor={handleAskAdvisorAboutCard}
                             onOpenHistory={handleOpenHistory}
-                            onOpenSsoSettings={() => openSettingsTab('sso')}
+                            onOpenSsoSettings={() => openSettingsTab('connections')}
                           />
                         ))}
                       </div>
@@ -2722,7 +3013,7 @@ export default function App() {
               setIsDraggingSplit(true);
             }}
             onDoubleClick={() => setRightPanePct(50)}
-            className={`hidden lg:flex w-2 shrink-0 cursor-col-resize items-center justify-center border-l border-slate-800/90 transition-colors group ${
+            className={`no-print hidden lg:flex w-2 shrink-0 cursor-col-resize items-center justify-center border-l border-slate-800/90 transition-colors group ${
               isDraggingSplit
                 ? 'bg-cyan-500/25 border-cyan-400/70'
                 : 'bg-[#0b0e14] hover:bg-cyan-500/15 hover:border-cyan-400/50'
@@ -2740,24 +3031,26 @@ export default function App() {
 
         {/* Collapsible Right Docked Panel: Fleet Logistics & Autopilot OR Gemini Strategic Advisor */}
         {rightSidebarMode === 'collapsed' ? (
-          <AdvisorSidebar
-            isCollapsed
-            onToggleCollapse={() => setRightSidebarMode('advisor')}
-            queuedRouteCount={queuedRouteCards.length}
-            onSwitchToRoute={() => setRightSidebarMode('route')}
-            messages={messages}
-            isLoading={isAdvisorLoading}
-            onSendMessage={handleSendAdvisorMessage}
-            onResetChat={() => {
-              setMessages([createWelcomeMessage(profile)]);
-              setAppliedActionIds([]);
-            }}
-            onExecuteAction={handleExecuteAdvisorAction}
-            appliedActionIds={appliedActionIds}
-            currentSystemName={profile.currentSystemName}
-            activeCategoryCount={checkedCategories.length}
-            activeTabLabel={activeTabLabel}
-          />
+          <div className="no-print">
+            <AdvisorSidebar
+              isCollapsed
+              onToggleCollapse={() => setRightSidebarMode('advisor')}
+              queuedRouteCount={queuedRouteCards.length}
+              onSwitchToRoute={() => setRightSidebarMode('route')}
+              messages={messages}
+              isLoading={isAdvisorLoading}
+              onSendMessage={handleSendAdvisorMessage}
+              onResetChat={() => {
+                setMessages([createWelcomeMessage(profile)]);
+                setAppliedActionIds([]);
+              }}
+              onExecuteAction={handleExecuteAdvisorAction}
+              appliedActionIds={appliedActionIds}
+              currentSystemName={profile.currentSystemName}
+              activeCategoryCount={checkedCategories.length}
+              activeTabLabel={activeTabLabel}
+            />
+          </div>
         ) : (
           <div
             className="w-full lg:h-full shrink-0 lg:min-w-[330px] lg:max-w-[66%] flex flex-col"
@@ -2767,6 +3060,17 @@ export default function App() {
               <RouteOptimizerSidebar
                 queuedCards={queuedRouteCards}
                 allCandidateCards={visibleCardsList}
+                snapshot={snapshot}
+                appSettings={appSettings}
+                savedRoutes={savedRoutes}
+                onSaveCommittedRoute={handleSaveCommittedRoute}
+                onMarkRouteCompleted={handleMarkRouteCompleted}
+                onDeleteSavedRoute={handleDeleteSavedRoute}
+                onRestoreRoute={handleRestoreRoute}
+                cardTransportMap={cardTransportMap}
+                haulOverrides={haulOverrides}
+                onSetHaulOverride={handleSetHaulOverride}
+                onClearHaulOverride={handleClearHaulOverride}
                 pilotSystemId={profile.currentSystemId}
                 pilotSystemName={profile.currentSystemName}
                 pilotStationId={profile.currentStationId}
@@ -2783,7 +3087,7 @@ export default function App() {
                 onSelectAllVisible={handleSelectAllVisible}
                 onApplyAutoFilledRoute={handleApplyAutoFilledRoute}
                 onSwitchToAdvisor={() => setRightSidebarMode('advisor')}
-                onOpenSsoSettings={() => openSettingsTab('sso')}
+                onOpenSsoSettings={() => openSettingsTab('connections')}
                 onCollapse={() => setRightSidebarMode('collapsed')}
               />
             ) : (
@@ -2815,6 +3119,8 @@ export default function App() {
         card={inspectedCard}
         profile={profile}
         eveAccessToken={eveAccessToken}
+        appSettings={appSettings}
+        snapshot={snapshot}
         shoppingListMode={showShoppingListDrawer}
         shoppingList={mergedShopping.lines}
         shoppingTotalIsk={mergedShopping.totalIsk}
@@ -2828,7 +3134,7 @@ export default function App() {
           setAppliedActionIds([]);
         }}
         onOpenHistory={handleOpenHistory}
-        onOpenSsoSettings={() => openSettingsTab('sso')}
+        onOpenSsoSettings={() => openSettingsTab('connections')}
         onClose={() => {
           setInspectedCard(null);
           setShowShoppingListDrawer(false);
@@ -2848,13 +3154,7 @@ export default function App() {
         onOpenEveMarketWindow={handleOpenEveMarketWindow}
         onOpenSsoSetup={() => {
           setOrderMonitorOpen(false);
-          if (!effectiveEveClientId) {
-            openApiSetupModal(
-              'Configure your EVE Client ID below to connect EVE SSO and monitor live undercuts and wallet fills.'
-            );
-          } else {
-            openSettingsTab('sso');
-          }
+          openSettingsTab('connections');
         }}
       />
 
@@ -2887,7 +3187,7 @@ export default function App() {
         aiSettings={aiSettings}
         onOpenSettings={() => {
           setPriceProjectionTarget(null);
-          openSettingsTab('profile');
+          openSettingsTab('connections');
         }}
         onClose={() => setPriceProjectionTarget(null)}
       />
@@ -2900,48 +3200,27 @@ export default function App() {
         onClose={() => setHaulerFlyoutContext(null)}
       />
 
-      {/* Subtle Bottom Footer Bar with Semantic Version Pill */}
-      <footer className="px-5 py-1.5 bg-[#0d1118] border-t border-slate-800/80 flex items-center justify-between gap-4 text-[11px] text-slate-500 shrink-0">
+      {/* Subtle Bottom Footer Bar with Clickable About Info Popover */}
+      <footer className="no-print px-5 py-1.5 bg-[#0d1118] border-t border-slate-800/80 flex items-center justify-between gap-4 text-[11px] text-slate-500 shrink-0">
         <div className="flex items-center gap-2 min-w-0">
           <span className="truncate">Foxy RedFox Indy Command</span>
           <span aria-hidden="true">·</span>
           <button
             type="button"
-            onClick={() => openApiSetupModal(null)}
+            onClick={() => openSettingsTab('connections')}
             className="text-slate-400 hover:text-cyan-300 transition-colors cursor-pointer whitespace-nowrap"
           >
-            API Setup
+            Settings &amp; APIs
           </button>
         </div>
-        <span
-          title={`Foxy RedFox Indy Command version ${__APP_VERSION__}`}
-          className="px-2 py-0.5 rounded-full bg-slate-900 border border-slate-800 font-mono text-[10px] text-slate-400 tabular-nums shrink-0"
-        >
-          v{__APP_VERSION__}
-        </span>
+        <AboutInfoPopover
+          position="top"
+          compact
+          onOpenSettings={() => openSettingsTab('connections')}
+        />
       </footer>
 
-      {/* Zero-Terminal "Bring Your Own Keys" API Setup Modal */}
-      <ApiSetupModal
-        isOpen={apiSetupOpen}
-        onClose={() => {
-          setApiSetupOpen(false);
-          setApiSetupReason(null);
-        }}
-        callbackUrl={callbackUrl}
-        hasEnvEveClientId={hasEnvEveClientId}
-        envEveClientId={envEveClientId}
-        customEveClientId={customEveClientId}
-        hasEnvGeminiKey={hasEnvGeminiKey}
-        customGeminiKey={customGeminiKey}
-        autoOpenedReason={apiSetupReason}
-        isSsoConnected={profile.mode === 'eve_sso'}
-        isSsoConnecting={isSsoConnecting}
-        onSaveKeys={handleSaveApiKeys}
-        onSaveAndConnectSso={handleSaveAndConnectSso}
-      />
-
-      {/* EVE SSO & Pilot Profile Settings Modal */}
+      {/* Unified 5-Tab Settings Hub Modal */}
       <SettingsModal
         isOpen={settingsOpen}
         initialTab={settingsInitialTab}
@@ -2964,6 +3243,8 @@ export default function App() {
         onOpenHistory={handleOpenHistory}
         aiSettings={aiSettings}
         onChangeAiSettings={handleChangeAiSettings}
+        appSettings={appSettings}
+        onChangeAppSettings={handleChangeAppSettings}
       />
     </div>
   );

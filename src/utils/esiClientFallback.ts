@@ -18,7 +18,11 @@ import type {
   WalletTransactionEntry,
 } from '../types/eve.ts';
 
-const ESI_BASE = 'https://esi.evetech.net/latest';
+const ESI_BASE = 'https://esi.evetech.net';
+export const ESI_COMPAT_HEADERS: Record<string, string> = {
+  Accept: 'application/json',
+  'X-Compatibility-Date': '2026-08-18',
+};
 
 export const ACTIVITY_LABEL_MAP: Record<number, string> = {
   1: 'Manufacturing',
@@ -52,8 +56,8 @@ export async function fetchIndustryCostIndicesClient(): Promise<IndustryCostSnap
   }
 
   const [sysRes, priceRes] = await Promise.all([
-    fetch(`${ESI_BASE}/industry/systems/?datasource=tranquility`),
-    fetch(`${ESI_BASE}/markets/prices/?datasource=tranquility`),
+    fetch(`${ESI_BASE}/industry/systems/?datasource=tranquility`, { headers: ESI_COMPAT_HEADERS }),
+    fetch(`${ESI_BASE}/markets/prices/?datasource=tranquility`, { headers: ESI_COMPAT_HEADERS }),
   ]);
 
   const costIndicesBySystem: Record<number, SystemCostIndices> = {};
@@ -244,7 +248,7 @@ export async function fetchCharacterIndustryJobsClient(
 
   const res = await fetch(
     `${ESI_BASE}/characters/${characterId}/industry/jobs/?datasource=tranquility&include_completed=false`,
-    { headers: { Authorization: `Bearer ${accessToken}` } }
+    { headers: { ...ESI_COMPAT_HEADERS, Authorization: `Bearer ${accessToken}` } }
   );
   if (!res.ok) {
     throw new Error(`ESI industry jobs returned HTTP ${res.status}`);
@@ -275,7 +279,7 @@ export async function fetchCharacterIndustryJobsClient(
     try {
       const nRes = await fetch(`${ESI_BASE}/universe/names/?datasource=tranquility`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { ...ESI_COMPAT_HEADERS, 'Content-Type': 'application/json' },
         body: JSON.stringify(Array.from(idsToResolve).slice(0, 500)),
       });
       if (nRes.ok) {
@@ -337,7 +341,7 @@ export async function fetchOrderMonitorClient(
     // Fall through to direct ESI
   }
 
-  const headers = { Authorization: `Bearer ${accessToken}` };
+  const headers = { ...ESI_COMPAT_HEADERS, Authorization: `Bearer ${accessToken}` };
   const [ordersRes, txRes] = await Promise.all([
     fetch(`${ESI_BASE}/characters/${characterId}/orders/?datasource=tranquility`, { headers }),
     fetch(`${ESI_BASE}/characters/${characterId}/wallet/transactions/?datasource=tranquility`, {
@@ -382,7 +386,7 @@ export async function fetchOrderMonitorClient(
     try {
       const nRes = await fetch(`${ESI_BASE}/universe/names/?datasource=tranquility`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { ...ESI_COMPAT_HEADERS, 'Content-Type': 'application/json' },
         body: JSON.stringify(Array.from(idsToName).slice(0, 500)),
       });
       if (nRes.ok) {
@@ -411,7 +415,8 @@ export async function fetchOrderMonitorClient(
     Array.from(pairSet.entries()).map(async ([key, { regionId, typeId }]) => {
       try {
         const r = await fetch(
-          `${ESI_BASE}/markets/${regionId}/orders/?datasource=tranquility&order_type=all&type_id=${typeId}`
+          `${ESI_BASE}/markets/${regionId}/orders/?datasource=tranquility&order_type=all&type_id=${typeId}`,
+          { headers: ESI_COMPAT_HEADERS }
         );
         if (!r.ok) return;
         const list = (await r.json()) as { is_buy_order: boolean; price: number }[];

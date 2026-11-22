@@ -113,6 +113,7 @@ export async function esiFetchTracked(
       headers: {
         Accept: 'application/json',
         'User-Agent': ESI_USER_AGENT,
+        'X-Compatibility-Date': '2026-08-18',
         ...(init.headers || {}),
       },
     });
@@ -326,7 +327,7 @@ async function resolveNamesChunk(ids: number[], out: Map<number, string>): Promi
   if (ids.length === 0 || getEsiRateLimitState().paused) return;
 
   const res = await esiFetchTracked(
-    'https://esi.evetech.net/latest/universe/names/?datasource=tranquility',
+    'https://esi.evetech.net/universe/names/?datasource=tranquility',
     {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -467,7 +468,7 @@ async function fetchAllMarketGroupsFromEsi(): Promise<Map<number, RawEsiMarketGr
   const groups = new Map<number, RawEsiMarketGroup>();
 
   const listRes = await esiFetchTracked(
-    'https://esi.evetech.net/latest/markets/groups/?datasource=tranquility',
+    'https://esi.evetech.net/markets/groups/?datasource=tranquility',
     {},
     8000
   );
@@ -490,14 +491,14 @@ async function fetchAllMarketGroupsFromEsi(): Promise<Map<number, RawEsiMarketGr
       const idx = cursor++;
       const id = allIds[idx];
       let res = await esiFetchTracked(
-        `https://esi.evetech.net/latest/markets/groups/${id}/?datasource=tranquility`,
+        `https://esi.evetech.net/markets/groups/${id}/?datasource=tranquility`,
         {},
         5500
       );
       if (!res && !getEsiRateLimitState().paused) {
         // Single lightweight retry on transient timeout
         res = await esiFetchTracked(
-          `https://esi.evetech.net/latest/markets/groups/${id}/?datasource=tranquility`,
+          `https://esi.evetech.net/markets/groups/${id}/?datasource=tranquility`,
           {},
           5500
         );
@@ -785,7 +786,7 @@ export async function fetch7DayHistoryStats(
   }
 
   const res = await esiCachedFetchJson<{ date: string; volume: number; average?: number }[]>(
-    `https://esi.evetech.net/latest/markets/${regionId}/history/?datasource=tranquility&type_id=${typeId}`,
+    `https://esi.evetech.net/markets/${regionId}/history/?datasource=tranquility&type_id=${typeId}`,
     {},
     { timeoutMs: 5500, fallbackTtlMs: HISTORY_7D_CACHE_TTL_MS }
   );
@@ -943,12 +944,12 @@ export async function scanMarketOrderBatch(
 
       const [jitaRes, dodixieRes] = await Promise.all([
         esiCachedFetchJson<RawEsiOrder[]>(
-          `https://esi.evetech.net/latest/markets/${EVE_ANCHORS.THE_FORGE_REGION_ID}/orders/?datasource=tranquility&order_type=all&type_id=${typeId}`,
+          `https://esi.evetech.net/markets/${EVE_ANCHORS.THE_FORGE_REGION_ID}/orders/?datasource=tranquility&order_type=all&type_id=${typeId}`,
           {},
           { timeoutMs: 7000, fallbackTtlMs: ORDER_CACHE_TTL_MS, forceRevalidate: force }
         ),
         esiCachedFetchJson<RawEsiOrder[]>(
-          `https://esi.evetech.net/latest/markets/${EVE_ANCHORS.SINQ_LAISON_REGION_ID}/orders/?datasource=tranquility&order_type=all&type_id=${typeId}`,
+          `https://esi.evetech.net/markets/${EVE_ANCHORS.SINQ_LAISON_REGION_ID}/orders/?datasource=tranquility&order_type=all&type_id=${typeId}`,
           {},
           { timeoutMs: 7000, fallbackTtlMs: ORDER_CACHE_TTL_MS, forceRevalidate: force }
         ),
