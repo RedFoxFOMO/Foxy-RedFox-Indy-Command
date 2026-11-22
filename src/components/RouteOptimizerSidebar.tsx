@@ -839,7 +839,7 @@ export function RouteOptimizerSidebar({
 
   const buildRouteExportText = () => {
     const lines: string[] = [
-      `FOXY REDFOX INDY COMMAND v2.2.0 — ROUTE MANIFEST`,
+      `FOXY REDFOX INDY COMMAND v2.2.1 — ROUTE MANIFEST`,
       `Origin: ${originSystemName} | Stops: ${optimized.stops.length} | Jumps: ${optimized.totalJumps} (${preference})`,
       `Hull: ${activeHull?.name || 'Auto'} | Peak Cargo: ${formatM3(optimized.peakCargoM3)} | Peak Value: ${formatIsk(optimized.peakCargoIsk)}`,
       `Buy Capital: ${formatIsk(optimized.totalBuyIsk)} | Net Profit (after haul): ${formatIsk(netProfitAfterHaulIsk)}`,
@@ -901,7 +901,7 @@ export function RouteOptimizerSidebar({
   const handleExportSharePayload = async () => {
     const payload = {
       app: 'Foxy RedFox Indy Command',
-      version: '2.2.0',
+      version: '2.2.1',
       origin: originSystemName,
       jumps: optimized.totalJumps,
       netProfitIsk: Math.round(netProfitAfterHaulIsk),

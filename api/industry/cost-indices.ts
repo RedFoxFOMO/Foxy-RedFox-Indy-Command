@@ -25,7 +25,7 @@ export default async function handler(req: ServerlessReq, res: ServerlessRes) {
           Accept: 'application/json',
           'X-Compatibility-Date': '2026-08-18',
           'User-Agent':
-            'Foxy-RedFox-Indy-Command/2.2.0 (+https://github.com/RedFoxFOMO/Foxy-RedFox-Indy-Command)',
+            'Foxy-RedFox-Indy-Command/2.2.1 (+https://github.com/RedFoxFOMO/Foxy-RedFox-Indy-Command)',
         },
       }),
       fetch('https://esi.evetech.net/markets/prices/?datasource=tranquility', {
@@ -33,7 +33,7 @@ export default async function handler(req: ServerlessReq, res: ServerlessRes) {
           Accept: 'application/json',
           'X-Compatibility-Date': '2026-08-18',
           'User-Agent':
-            'Foxy-RedFox-Indy-Command/2.2.0 (+https://github.com/RedFoxFOMO/Foxy-RedFox-Indy-Command)',
+            'Foxy-RedFox-Indy-Command/2.2.1 (+https://github.com/RedFoxFOMO/Foxy-RedFox-Indy-Command)',
         },
       }),
     ]);

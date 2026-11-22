@@ -1240,7 +1240,7 @@ async function fetchTopRegionalOrders(
   regionId: number,
   typeId: number,
   orderType: 'sell' | 'buy',
-  limit = 16
+  limit = 500
 ): Promise<{
   orders: EsiMarketOrderRaw[];
   prevTopPrice?: number;
@@ -1273,16 +1273,17 @@ async function fetchTopRegionalOrders(
     };
   }
 
+  // Retain full sorted order book (safety ceiling of 500 orders per side so thin & deep markets can be fully inspected past row 8)
   const sorted =
     orderType === 'sell'
       ? res.data
           .filter((o) => !o.is_buy_order && o.volume_remain > 0)
           .sort((a, b) => a.price - b.price)
-          .slice(0, 20)
+          .slice(0, 500)
       : res.data
           .filter((o) => o.is_buy_order && o.volume_remain > 0)
           .sort((a, b) => b.price - a.price)
-          .slice(0, 20);
+          .slice(0, 500);
 
   const priorTop =
     orderType === 'sell' ? cached?.sellOrders?.[0]?.price : cached?.buyOrders?.[0]?.price;
@@ -1328,8 +1329,8 @@ app.get('/api/market/orderbook', async (req, res) => {
       buySystemRegionId,
       routeToBuy,
     ] = await Promise.all([
-      fetchTopRegionalOrders(buyRegionId, typeId, 'sell', 12),
-      fetchTopRegionalOrders(sellRegionId, typeId, 'buy', 12),
+      fetchTopRegionalOrders(buyRegionId, typeId, 'sell', 500),
+      fetchTopRegionalOrders(sellRegionId, typeId, 'buy', 500),
       fetch7DayHistoryStats(buyRegionId, typeId),
       pilotSystemId > 0 ? resolveSystemRegionId(pilotSystemId) : Promise.resolve(null),
       buySystemId > 0 ? resolveSystemRegionId(buySystemId) : Promise.resolve(buyRegionId),
@@ -3778,7 +3779,7 @@ app.post('/api/integrations/discord-webhook', async (req, res) => {
     }
 
     const payload: Record<string, unknown> = {
-      username: 'Foxy RedFox Indy Command v2.2.0',
+      username: 'Foxy RedFox Indy Command v2.2.1',
     };
     if (safeContent) payload.content = safeContent;
     if (Array.isArray(embeds) && embeds.length > 0) {

@@ -62,6 +62,7 @@ interface ActionCardProps {
   isPinnedToWatchlist?: boolean;
   committedQty?: number;
   onCommitQty?: (cardId: string, qty: number) => void;
+  onResetQty?: (cardId: string) => void;
   cardExecutionModeOverride?: OrderExecutionMode;
   onChangeCardExecutionMode?: (cardId: string, mode: OrderExecutionMode) => void;
   cardTransportCostIsk?: number;
@@ -125,6 +126,7 @@ export function ActionCard({
   isPinnedToWatchlist = false,
   committedQty,
   onCommitQty,
+  onResetQty,
   cardExecutionModeOverride,
   onChangeCardExecutionMode,
   cardTransportCostIsk = 0,
@@ -734,14 +736,32 @@ export function ActionCard({
                   </button>
                 </div>
 
-                {activeQty !== optimalQty && (
+                {activeQty !== baseQty && (
+                  <div className="inline-flex flex-wrap items-center gap-1.5">
+                    <span className="inline-flex items-center px-2 py-0.5 rounded border border-amber-400/50 bg-amber-500/15 font-mono tabular-nums text-[11px] font-medium text-amber-200">
+                      Custom Qty: {activeQty.toLocaleString('en-US')} (Advised: {baseQty.toLocaleString('en-US')})
+                    </span>
+                    <button
+                      type="button"
+                      onClick={() =>
+                        onResetQty ? onResetQty(card.id) : commitNewQty(baseQty)
+                      }
+                      title={`Reset back to advised batch quantity (${baseQty.toLocaleString('en-US')})`}
+                      className="inline-flex items-center gap-1 px-2 py-1 rounded border border-cyan-500/45 bg-cyan-500/10 text-[11px] font-medium text-cyan-200 hover:bg-cyan-500/20 transition-colors cursor-pointer"
+                    >
+                      <RotateCcw className="w-3 h-3" aria-hidden="true" />
+                      <span>Reset to Advised</span>
+                    </button>
+                  </div>
+                )}
+
+                {optimalQty !== baseQty && activeQty !== optimalQty && (
                   <button
                     type="button"
                     onClick={() => commitNewQty(optimalQty)}
-                    title={`Reset to optimal depth-walked profitable volume (${optimalQty.toLocaleString('en-US')})`}
-                    className="inline-flex items-center gap-1 px-2 py-1 rounded border border-cyan-500/40 bg-cyan-500/10 text-[11px] font-medium text-cyan-200 hover:bg-cyan-500/20 transition-colors cursor-pointer"
+                    title={`Set to optimal depth-walked profitable volume (${optimalQty.toLocaleString('en-US')})`}
+                    className="inline-flex items-center gap-1 px-2 py-1 rounded border border-slate-700/90 bg-[#0b0e14] text-[11px] font-medium text-slate-300 hover:border-cyan-400/50 hover:text-cyan-200 transition-colors cursor-pointer"
                   >
-                    <RotateCcw className="w-3 h-3" aria-hidden="true" />
                     <span>Max Profitable ({optimalQty.toLocaleString('en-US')})</span>
                   </button>
                 )}
@@ -1128,6 +1148,8 @@ export function ActionCard({
                 profile={profile}
                 eveAccessToken={eveAccessToken}
                 appSettings={appSettings}
+                effectiveQty={activeQty}
+                advisedQty={baseQty}
                 onOpenSsoSettings={onOpenSsoSettings}
               />
             </div>

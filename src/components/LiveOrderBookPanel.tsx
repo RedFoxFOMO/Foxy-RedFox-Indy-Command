@@ -32,6 +32,8 @@ interface LiveOrderBookPanelProps {
   profile: PilotProfile;
   eveAccessToken: string | null;
   appSettings?: AppSettingsV22;
+  effectiveQty?: number;
+  advisedQty?: number;
   onOpenSsoSettings: () => void;
 }
 
@@ -165,26 +167,70 @@ function annotateOrderDepth(
   orders: LiveOrderBookEntry[],
   targetQty: number
 ): {
-  rows: (LiveOrderBookEntry & { fillsQty: number; isHighlighted: boolean })[];
+  rows: (LiveOrderBookEntry & {
+    rowNumber: number;
+    fillsQty: number;
+    cumulativeFilledQty: number;
+    isHighlighted: boolean;
+    isPartialFill: boolean;
+  })[];
   coveredQty: number;
+  shortfallQty: number;
   highlightedCount: number;
+  fillReachedRow: number | null;
+  totalIsk: number;
+  weightedAvgPrice: number;
 } {
-  let remaining = Math.max(0, Math.round(targetQty));
+  const goal = Math.max(0, Math.round(targetQty));
+  let remaining = goal;
   let coveredQty = 0;
   let highlightedCount = 0;
+  let fillReachedRow: number | null = null;
+  let totalIsk = 0;
 
-  const rows = orders.map((order) => {
+  const rows = orders.map((order, index) => {
+    const rowNumber = index + 1;
     if (remaining <= 0) {
-      return { ...order, fillsQty: 0, isHighlighted: false };
+      return {
+        ...order,
+        rowNumber,
+        fillsQty: 0,
+        cumulativeFilledQty: coveredQty,
+        isHighlighted: false,
+        isPartialFill: false,
+      };
     }
     const take = Math.min(order.volumeRemain, remaining);
     remaining -= take;
     coveredQty += take;
-    if (take > 0) highlightedCount += 1;
-    return { ...order, fillsQty: take, isHighlighted: take > 0 };
+    totalIsk += take * order.price;
+    const isHighlighted = take > 0;
+    const isPartialFill = take > 0 && take < order.volumeRemain;
+    if (isHighlighted) {
+      highlightedCount += 1;
+      if (remaining === 0 && fillReachedRow === null) {
+        fillReachedRow = rowNumber;
+      }
+    }
+    return {
+      ...order,
+      rowNumber,
+      fillsQty: take,
+      cumulativeFilledQty: coveredQty,
+      isHighlighted,
+      isPartialFill,
+    };
   });
 
-  return { rows, coveredQty, highlightedCount };
+  return {
+    rows,
+    coveredQty,
+    shortfallQty: Math.max(0, goal - coveredQty),
+    highlightedCount,
+    fillReachedRow,
+    totalIsk,
+    weightedAvgPrice: coveredQty > 0 ? totalIsk / coveredQty : 0,
+  };
 }
 
 export function LiveOrderBookPanel({
@@ -192,6 +238,8 @@ export function LiveOrderBookPanel({
   profile,
   eveAccessToken,
   appSettings,
+  effectiveQty,
+  advisedQty,
   onOpenSsoSettings,
 }: LiveOrderBookPanelProps) {
   // Derive inspectable item targets from the card's routeChains & primaryTypeId
@@ -271,7 +319,7 @@ export function LiveOrderBookPanel({
       );
     }
 
-    return list.slice(0, 8);
+    return list.slice(0, 16);
   }, [card]);
 
   const [selectedTypeId, setSelectedTypeId] = useState<number>(
@@ -386,10 +434,25 @@ export function LiveOrderBookPanel({
     );
   }
 
+  const baseCardQty = Math.max(
+    1,
+    Math.round(advisedQty ?? card.baseBatchQty ?? card.outputUnits ?? 1)
+  );
+  const liveEffectiveQty = Math.max(1, Math.round(effectiveQty ?? baseCardQty));
+  const qtyScale = baseCardQty > 0 ? liveEffectiveQty / baseCardQty : 1;
+  const isCustomQty = liveEffectiveQty !== baseCardQty;
+
+  const rawBuyQty = activeTarget.buyQty > 0 ? activeTarget.buyQty : baseCardQty;
+  const rawSellQty = activeTarget.sellQty > 0 ? activeTarget.sellQty : baseCardQty;
+
   const targetBuyQty =
-    activeTarget.buyQty > 0 ? activeTarget.buyQty : Math.max(1, card.outputUnits);
+    activeTarget.typeId === card.primaryTypeId && card.engine !== 'indy_invention'
+      ? liveEffectiveQty
+      : Math.max(1, Math.round(rawBuyQty * qtyScale));
   const targetSellQty =
-    activeTarget.sellQty > 0 ? activeTarget.sellQty : Math.max(1, card.outputUnits);
+    activeTarget.typeId === card.primaryTypeId && card.engine !== 'indy_invention'
+      ? liveEffectiveQty
+      : Math.max(1, Math.round(rawSellQty * qtyScale));
 
   const sellHubDepth = annotateOrderDepth(
     data?.topSellOrdersAtBuyHub ?? [],
@@ -595,37 +658,43 @@ export function LiveOrderBookPanel({
         </div>
       )}
 
-      {/* Dual EVE-Style Live Regional Order Book Tables */}
+      {/* Dual Full-Depth Scrollable EVE-Style Live Regional Order Book Tables */}
       <div className="grid grid-cols-1 xl:grid-cols-2 gap-3.5">
-        {/* Table 1: Top 8 Live Sell Orders at Buy Hub (Lowest Price First) */}
+        {/* Table 1: Full Live Sell Orders at Buy Hub (Lowest Price First) */}
         <div className="border border-slate-800/90 rounded-lg bg-[#10151f] overflow-hidden flex flex-col">
-          <div className="px-3 py-2 border-b border-slate-800/90 bg-[#131822] flex items-center justify-between gap-2">
+          <div className="px-3 py-2 border-b border-slate-800/90 bg-[#131822] flex flex-wrap items-center justify-between gap-2">
             <div className="min-w-0">
               <div className="text-xs font-semibold text-emerald-300 truncate">
-                Top 8 Sell Orders · {data?.buyRegionName || activeTarget.buySystemName}
+                Sell Orders ({sellHubDepth.rows.length}) · {data?.buyRegionName || activeTarget.buySystemName}
               </div>
               <div className="text-[10px] text-slate-400 font-mono tabular-nums">
-                Lowest price first · Highlighted covers {sellHubDepth.coveredQty.toLocaleString('en-US')} /{' '}
+                Lowest price first · Covers {sellHubDepth.coveredQty.toLocaleString('en-US')} /{' '}
                 {targetBuyQty.toLocaleString('en-US')} buy qty
+                {sellHubDepth.weightedAvgPrice > 0
+                  ? ` · Avg ${formatIsk(sellHubDepth.weightedAvgPrice, false)}`
+                  : ''}
               </div>
             </div>
             <span
-              className={`font-mono text-[10px] px-1.5 py-0.5 rounded border shrink-0 ${
-                sellHubDepth.coveredQty >= targetBuyQty
-                  ? 'border-emerald-500/40 bg-emerald-500/10 text-emerald-300'
-                  : 'border-amber-500/40 bg-amber-500/10 text-amber-300'
+              className={`font-mono text-[10px] px-2 py-0.5 rounded border shrink-0 font-semibold ${
+                sellHubDepth.fillReachedRow !== null
+                  ? 'border-emerald-500/45 bg-emerald-500/15 text-emerald-200'
+                  : 'border-amber-500/50 bg-amber-500/15 text-amber-200'
               }`}
             >
-              {sellHubDepth.coveredQty >= targetBuyQty
-                ? `${sellHubDepth.highlightedCount} order${sellHubDepth.highlightedCount === 1 ? '' : 's'} fill`
-                : 'Thin Depth'}
+              {sellHubDepth.fillReachedRow !== null
+                ? `Fill Depth Reached at Row #${sellHubDepth.fillReachedRow}`
+                : sellHubDepth.rows.length > 0
+                  ? `Shortfall after Row #${sellHubDepth.rows.length} (-${sellHubDepth.shortfallQty.toLocaleString('en-US')})`
+                  : 'No Sell Depth'}
             </span>
           </div>
 
-          <div className="overflow-x-auto">
+          <div className="max-h-72 overflow-y-auto overflow-x-auto">
             <table className="w-full text-[11px] border-collapse">
-              <thead>
-                <tr className="border-b border-slate-800/80 text-slate-400 bg-[#0d121a]">
+              <thead className="sticky top-0 z-10 bg-[#0d121a] shadow-[0_1px_0_rgba(30,41,59,0.9)]">
+                <tr className="border-b border-slate-800/80 text-slate-400">
+                  <th className="py-1.5 px-2 text-center font-medium w-9">#</th>
                   <th className="py-1.5 px-2.5 text-right font-medium">Price (ISK)</th>
                   <th className="py-1.5 px-2.5 text-right font-medium">Vol Remain</th>
                   <th className="py-1.5 px-2.5 text-left font-medium">Station</th>
@@ -635,13 +704,13 @@ export function LiveOrderBookPanel({
               <tbody className="divide-y divide-slate-800/60">
                 {isLoading && !data ? (
                   <tr>
-                    <td colSpan={4} className="py-6 text-center text-slate-500 font-mono">
+                    <td colSpan={5} className="py-6 text-center text-slate-500 font-mono">
                       Querying live ESI regional sell orders...
                     </td>
                   </tr>
                 ) : sellHubDepth.rows.length === 0 ? (
                   <tr>
-                    <td colSpan={4} className="py-6 text-center text-slate-500">
+                    <td colSpan={5} className="py-6 text-center text-slate-500">
                       No active Sell orders returned in this region.
                     </td>
                   </tr>
@@ -661,11 +730,18 @@ export function LiveOrderBookPanel({
                       <tr
                         key={order.orderId}
                         className={
-                          order.isHighlighted
-                            ? 'bg-emerald-500/12 text-slate-100'
-                            : 'text-slate-400 hover:bg-slate-800/30'
+                          order.isPartialFill
+                            ? 'bg-emerald-500/20 text-slate-100 ring-1 ring-inset ring-emerald-400/45'
+                            : order.isHighlighted
+                              ? 'bg-emerald-500/12 text-slate-100'
+                              : 'text-slate-400 hover:bg-slate-800/30'
                         }
                       >
+                        <td className="py-1.5 px-2 text-center font-mono tabular-nums text-[10px] text-slate-500 whitespace-nowrap">
+                          <span className={order.isHighlighted ? 'text-emerald-300 font-semibold' : ''}>
+                            #{order.rowNumber}
+                          </span>
+                        </td>
                         <td className="py-1.5 px-2.5 text-right font-mono tabular-nums font-medium whitespace-nowrap">
                           <span className={order.isHighlighted ? 'text-emerald-300' : 'text-slate-300'}>
                             {order.price.toLocaleString('en-US', {
@@ -677,8 +753,16 @@ export function LiveOrderBookPanel({
                         <td className="py-1.5 px-2.5 text-right font-mono tabular-nums whitespace-nowrap">
                           <span>{order.volumeRemain.toLocaleString('en-US')}</span>
                           {order.isHighlighted && (
-                            <span className="ml-1 text-[9px] text-emerald-300">
-                              ({order.fillsQty.toLocaleString('en-US')})
+                            <span
+                              className={`ml-1 text-[9px] px-1 py-0.5 rounded ${
+                                order.isPartialFill
+                                  ? 'bg-amber-500/20 text-amber-200 border border-amber-400/40'
+                                  : 'text-emerald-300'
+                              }`}
+                            >
+                              {order.isPartialFill
+                                ? `partial ${order.fillsQty.toLocaleString('en-US')}`
+                                : `take ${order.fillsQty.toLocaleString('en-US')}`}
                             </span>
                           )}
                         </td>
@@ -716,35 +800,41 @@ export function LiveOrderBookPanel({
           </div>
         </div>
 
-        {/* Table 2: Top 8 Live Buy Orders at Sell Hub (Highest Price First) */}
+        {/* Table 2: Full Live Buy Orders at Sell Hub (Highest Price First) */}
         <div className="border border-slate-800/90 rounded-lg bg-[#10151f] overflow-hidden flex flex-col">
-          <div className="px-3 py-2 border-b border-slate-800/90 bg-[#131822] flex items-center justify-between gap-2">
+          <div className="px-3 py-2 border-b border-slate-800/90 bg-[#131822] flex flex-wrap items-center justify-between gap-2">
             <div className="min-w-0">
               <div className="text-xs font-semibold text-amber-300 truncate">
-                Top 8 Buy Orders · {data?.sellRegionName || activeTarget.sellSystemName}
+                Buy Orders ({buyHubDepth.rows.length}) · {data?.sellRegionName || activeTarget.sellSystemName}
               </div>
               <div className="text-[10px] text-slate-400 font-mono tabular-nums">
-                Highest price first · Highlighted covers {buyHubDepth.coveredQty.toLocaleString('en-US')} /{' '}
+                Highest price first · Covers {buyHubDepth.coveredQty.toLocaleString('en-US')} /{' '}
                 {targetSellQty.toLocaleString('en-US')} sell qty
+                {buyHubDepth.weightedAvgPrice > 0
+                  ? ` · Avg ${formatIsk(buyHubDepth.weightedAvgPrice, false)}`
+                  : ''}
               </div>
             </div>
             <span
-              className={`font-mono text-[10px] px-1.5 py-0.5 rounded border shrink-0 ${
-                buyHubDepth.coveredQty >= targetSellQty
-                  ? 'border-sky-500/40 bg-sky-500/10 text-sky-300'
-                  : 'border-amber-500/40 bg-amber-500/10 text-amber-300'
+              className={`font-mono text-[10px] px-2 py-0.5 rounded border shrink-0 font-semibold ${
+                buyHubDepth.fillReachedRow !== null
+                  ? 'border-sky-500/45 bg-sky-500/15 text-sky-200'
+                  : 'border-amber-500/50 bg-amber-500/15 text-amber-200'
               }`}
             >
-              {buyHubDepth.coveredQty >= targetSellQty
-                ? `${buyHubDepth.highlightedCount} order${buyHubDepth.highlightedCount === 1 ? '' : 's'} absorb`
-                : 'List Sell Order'}
+              {buyHubDepth.fillReachedRow !== null
+                ? `Fill Depth Reached at Row #${buyHubDepth.fillReachedRow}`
+                : buyHubDepth.rows.length > 0
+                  ? `Shortfall after Row #${buyHubDepth.rows.length} (-${buyHubDepth.shortfallQty.toLocaleString('en-US')})`
+                  : 'List Sell Order'}
             </span>
           </div>
 
-          <div className="overflow-x-auto">
+          <div className="max-h-72 overflow-y-auto overflow-x-auto">
             <table className="w-full text-[11px] border-collapse">
-              <thead>
-                <tr className="border-b border-slate-800/80 text-slate-400 bg-[#0d121a]">
+              <thead className="sticky top-0 z-10 bg-[#0d121a] shadow-[0_1px_0_rgba(30,41,59,0.9)]">
+                <tr className="border-b border-slate-800/80 text-slate-400">
+                  <th className="py-1.5 px-2 text-center font-medium w-9">#</th>
                   <th className="py-1.5 px-2.5 text-right font-medium">Price (ISK)</th>
                   <th className="py-1.5 px-2.5 text-right font-medium">Vol Remain</th>
                   <th className="py-1.5 px-2.5 text-left font-medium">Station</th>
@@ -754,13 +844,13 @@ export function LiveOrderBookPanel({
               <tbody className="divide-y divide-slate-800/60">
                 {isLoading && !data ? (
                   <tr>
-                    <td colSpan={4} className="py-6 text-center text-slate-500 font-mono">
+                    <td colSpan={5} className="py-6 text-center text-slate-500 font-mono">
                       Querying live ESI regional buy orders...
                     </td>
                   </tr>
                 ) : buyHubDepth.rows.length === 0 ? (
                   <tr>
-                    <td colSpan={4} className="py-6 text-center text-slate-500">
+                    <td colSpan={5} className="py-6 text-center text-slate-500">
                       No active Buy orders returned in this region.
                     </td>
                   </tr>
@@ -771,11 +861,18 @@ export function LiveOrderBookPanel({
                       <tr
                         key={order.orderId}
                         className={
-                          order.isHighlighted
-                            ? 'bg-sky-500/12 text-slate-100'
-                            : 'text-slate-400 hover:bg-slate-800/30'
+                          order.isPartialFill
+                            ? 'bg-sky-500/20 text-slate-100 ring-1 ring-inset ring-sky-400/45'
+                            : order.isHighlighted
+                              ? 'bg-sky-500/12 text-slate-100'
+                              : 'text-slate-400 hover:bg-slate-800/30'
                         }
                       >
+                        <td className="py-1.5 px-2 text-center font-mono tabular-nums text-[10px] text-slate-500 whitespace-nowrap">
+                          <span className={order.isHighlighted ? 'text-sky-300 font-semibold' : ''}>
+                            #{order.rowNumber}
+                          </span>
+                        </td>
                         <td className="py-1.5 px-2.5 text-right font-mono tabular-nums font-medium whitespace-nowrap">
                           <span className={order.isHighlighted ? 'text-amber-300' : 'text-slate-300'}>
                             {order.price.toLocaleString('en-US', {
@@ -787,8 +884,16 @@ export function LiveOrderBookPanel({
                         <td className="py-1.5 px-2.5 text-right font-mono tabular-nums whitespace-nowrap">
                           <span>{order.volumeRemain.toLocaleString('en-US')}</span>
                           {order.isHighlighted && (
-                            <span className="ml-1 text-[9px] text-sky-300">
-                              ({order.fillsQty.toLocaleString('en-US')})
+                            <span
+                              className={`ml-1 text-[9px] px-1 py-0.5 rounded ${
+                                order.isPartialFill
+                                  ? 'bg-amber-500/20 text-amber-200 border border-amber-400/40'
+                                  : 'text-sky-300'
+                              }`}
+                            >
+                              {order.isPartialFill
+                                ? `partial ${order.fillsQty.toLocaleString('en-US')}`
+                                : `fill ${order.fillsQty.toLocaleString('en-US')}`}
                             </span>
                           )}
                         </td>
@@ -835,7 +940,11 @@ export function LiveOrderBookPanel({
       {/* Subtle footer timestamp & depth legend */}
       <div className="flex flex-wrap items-center justify-between gap-2 text-[10px] text-slate-500 font-mono">
         <span>
-          Highlighted rows indicate exact orders covering your calculated batch volume ({formatIsk(card.requiredCapitalIsk)} capital).
+          Highlighted rows walk your live effective volume (
+          {isCustomQty
+            ? `Custom Qty: ${liveEffectiveQty.toLocaleString('en-US')} · Advised: ${baseCardQty.toLocaleString('en-US')}`
+            : `Advised Qty: ${baseCardQty.toLocaleString('en-US')}`}
+          ) · Scroll to inspect full regional depth.
         </span>
         {data?.fetchedAt && (
           <span>

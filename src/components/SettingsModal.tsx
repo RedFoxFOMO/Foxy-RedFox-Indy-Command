@@ -165,7 +165,7 @@ export function SettingsModal({
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           webhookUrl: url,
-          content: `**Foxy RedFox Indy Command v2.2.0** — Test Ping confirmed for **${profile.characterName}** (${profile.currentSystemName}). Ready to receive committed routes & corp job exports!`,
+          content: `**Foxy RedFox Indy Command v2.2.1** — Test Ping confirmed for **${profile.characterName}** (${profile.currentSystemName}). Ready to receive committed routes & corp job exports!`,
         }),
       });
       const json = (await res.json()) as { ok?: boolean; error?: string };
@@ -209,7 +209,7 @@ export function SettingsModal({
         <div className="px-6 py-4 border-b border-slate-800 flex items-center justify-between gap-4">
           <div>
             <h2 className="font-display text-base font-semibold text-slate-100">
-              Unified Settings Hub — v2.2.0
+              Unified Settings Hub — v2.2.1
             </h2>
             <p className="text-xs text-slate-400 mt-0.5">
               Centralized EVE Online SSO (PKCE), optional BYOK AI keys, Discord webhooks, standing-exact fee rules, refining rules, and UI preferences.

@@ -2078,6 +2078,28 @@ export default function App() {
     );
   }, []);
 
+  const handleResetCardQty = useCallback(
+    (cardId: string) => {
+      setQtyOverridesByCardId((prev) => {
+        if (!(cardId in prev)) return prev;
+        const next = { ...prev };
+        delete next[cardId];
+        return next;
+      });
+      const baseCard =
+        engineBundle.cards.find((c) => c.id === cardId) ?? externalPinnedCards[cardId];
+      if (baseCard) {
+        const advised = Math.max(1, Math.round(baseCard.baseBatchQty ?? baseCard.outputUnits ?? 1));
+        setBuildQueue((prev) =>
+          prev.some((e) => e.cardId === cardId)
+            ? prev.map((e) => (e.cardId === cardId ? { ...e, committedRuns: advised } : e))
+            : prev
+        );
+      }
+    },
+    [engineBundle.cards, externalPinnedCards]
+  );
+
   // Build Queue handlers
   const handleAddToBuildQueue = useCallback(
     (card: ActionCardData, runs: number, slots: number) => {
@@ -2156,7 +2178,7 @@ export default function App() {
   const applyCommittedQtyToCard = useCallback(
     (card: ActionCardData): ActionCardData => {
       const override = qtyOverridesByCardId[card.id];
-      const baseQty = card.baseBatchQty ?? 0;
+      const baseQty = Math.max(1, Math.round(card.baseBatchQty ?? card.outputUnits ?? 0));
       if (!override || baseQty <= 0 || override === baseQty) return card;
       const ratio = override / baseQty;
       return {
@@ -2942,6 +2964,7 @@ export default function App() {
                             }
                             committedQty={qtyOverridesByCardId[card.id]}
                             onCommitQty={handleCommitCardQty}
+                            onResetQty={handleResetCardQty}
                             cardExecutionModeOverride={cardExecModeOverrides[card.id]}
                             onChangeCardExecutionMode={handleChangeCardExecutionMode}
                             cardTransportCostIsk={cardTransportMap[card.id]?.transportIsk}
@@ -3116,11 +3139,34 @@ export default function App() {
 
       {/* High-Density Inspection Drawer */}
       <InspectDrawer
-        card={inspectedCard}
+        card={
+          inspectedCard
+            ? (engineBundle.cards.find((c) => c.id === inspectedCard.id) ??
+              externalPinnedCards[inspectedCard.id] ??
+              inspectedCard)
+            : null
+        }
         profile={profile}
         eveAccessToken={eveAccessToken}
         appSettings={appSettings}
         snapshot={snapshot}
+        committedQty={inspectedCard ? qtyOverridesByCardId[inspectedCard.id] : undefined}
+        onCommitQty={handleCommitCardQty}
+        onResetQty={handleResetCardQty}
+        cardExecutionModeOverride={
+          inspectedCard ? cardExecModeOverrides[inspectedCard.id] : undefined
+        }
+        cardTransportCostIsk={
+          inspectedCard ? cardTransportMap[inspectedCard.id]?.transportIsk : undefined
+        }
+        haulCostOverrideIsk={
+          inspectedCard && haulOverrides[inspectedCard.id] !== undefined
+            ? haulOverrides[inspectedCard.id]
+            : null
+        }
+        structureConfig={structureConfig}
+        activeMfgJobCount={activeMfgJobCount}
+        onOpenHaulerFlyout={setHaulerFlyoutContext}
         shoppingListMode={showShoppingListDrawer}
         shoppingList={mergedShopping.lines}
         shoppingTotalIsk={mergedShopping.totalIsk}

@@ -62,10 +62,10 @@ export default async function handler(req: ServerlessReq, res: ServerlessRes) {
       headers: {
         'Content-Type': 'application/json',
         'User-Agent':
-          'Foxy-RedFox-Indy-Command/2.2.0 (+https://github.com/RedFoxFOMO/Foxy-RedFox-Indy-Command)',
+          'Foxy-RedFox-Indy-Command/2.2.1 (+https://github.com/RedFoxFOMO/Foxy-RedFox-Indy-Command)',
       },
       body: JSON.stringify({
-        username: 'Foxy RedFox Indy Command v2.2.0',
+        username: 'Foxy RedFox Indy Command v2.2.1',
         ...(content ? { content } : {}),
         ...(embeds && embeds.length > 0 ? { embeds } : {}),
       }),

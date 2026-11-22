@@ -3,11 +3,11 @@
 
 import type { NpcStandingsMap, TradeHubId } from '../types/eve.ts';
 
-export const APP_VERSION = '2.2.0';
-export const APP_RELEASE_DATE = '2026-11-21';
+export const APP_VERSION = '2.2.1';
+export const APP_RELEASE_DATE = '2026-11-22';
 export const ESI_COMPATIBILITY_DATE = '2026-08-18';
 export const ESI_USER_AGENT_V22 =
-  'Foxy-RedFox-Indy-Command/2.2.0 (+https://github.com/RedFoxFOMO/Foxy-RedFox-Indy-Command)';
+  'Foxy-RedFox-Indy-Command/2.2.1 (+https://github.com/RedFoxFOMO/Foxy-RedFox-Indy-Command)';
 export const ESI_BASE_URL = 'https://esi.evetech.net';
 
 export interface HubNpcOwnerInfo {

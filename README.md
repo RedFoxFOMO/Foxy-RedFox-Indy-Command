@@ -2,7 +2,7 @@
   <img src="./public/foxy-indy-banner.jpg" alt="Foxy RedFox Indy Command Banner" width="100%" />
 </div>
 
-# Foxy RedFox Indy Command `v2.2.0`
+# Foxy RedFox Indy Command `v2.2.1`
 
 **Turn New Eden's regional markets, public contracts, station spreads, industry slots, and hauling routes into a single automated ISK-making command console.**
 
@@ -21,15 +21,36 @@
 
 ---
 
-## What's New in `v2.2.0`
+## Coming Next: `v5.0.0` — 404 Industries: Flight Deck
+
+> **Major Next-Generation Release Preview:** The next major milestone transforms Foxy RedFox Indy Command into **404 Industries: Flight Deck** — a unified tactical and industrial command bridge built for solo industrialists, fleet haulers, and allied corporations alike.
+
+* **Visual Command Bridge Overhaul (with Reversible Classic Production Lock):** A next-generation cockpit layout with live tactical telemetry, modular bridge panels, and a one-click **Classic Production Lock** so veteran pilots can switch back to the classic production grid anytime.
+* **Planetary Industry & LP Store Optimizers:** End-to-end P0→P4 factory chain margin calculators, POCO tax & extractor planners, and live faction **LP Store** ISK/LP conversion scanners with orderbook depth validation.
+* **Corp Structure Fuel Automation:** Automated fuel-block burn countdowns, service-module consumption tracking, low-fuel alerts, and one-click Jita Multi-Buy + hauling manifests for Upwell citadels, refineries, and engineering complexes.
+* **Next 3 Best Actions Engine:** An intelligent command prioritizer that scans your live wallet, open industry/market slots, cargo capacity, and active standings to surface the **top 3 highest-impact ISK moves right now**.
+* **Tactical D-Scan & Cargo Decision Computer:** Instant paste-to-intel **D-Scan** fleet/threat composition analyzer paired with a live **Cargo Risk & Evade/Engage Decision Computer** for low-sec, null-sec, and high-sec gank corridors.
+* **Prescriptive Mining Optimizer:** Real-time ore, ice, moon-goo, and gas ISK/m³/hr recommendations tuned to your active mining hull, boosts, crystals, refining yields, and nearby buyback or hub prices.
+* **Associate Corp Access:** Secure role-scoped access for allied and associate corporation pilots to collaborate on shared buyback targets, structure fuel runs, and coordinated build queues without exposing director-only keys.
+
+---
+
+## What's New in `v2.2.1` (Hotfix & Depth Upgrade)
+
+* **Synchronized Card-to-Inspection Quantities:** Adjusting `Qty` or `Runs` (`-` / `+` or manual input) on any card or inside the Inspection Drawer now stays 100% synchronized across cards, Inspection depth walks, BOM/material tables, depth-split Multi-Buy/Sell manifests, hauler m³/trip sizing, Build Queue, and Route state—complete with a **`Custom Qty: X (Advised: Y)`** badge and one-click **`Reset to Advised`** button.
+* **Full Scrollable Order Book Depth:** Removed the 8-row orderbook cutoff so thin markets walking past row 8 can be audited completely inside a scrollable sticky-header table, highlighting every consumed row (including partial fills on the final row) with a live **"Fill Depth Reached at Row #X"** indicator.
+
+---
+
+## Highlights from `v2.2.0`
 
 ### 1. Unified Settings Hub, About Info Badge & Locked Info Tips
 * **One Unified Settings Modal:** Every connection and preference lives in a single 5-tab **Settings** modal (*Connections & APIs*, *Trading & Fee Defaults*, *Industry & Refining Rules*, *Hauling & Route Cadence*, and *UI & Alerts*), including EVE SSO PKCE, optional BYOK AI keys (Gemini/OpenAI in browser `localStorage`), **Discord Channel Webhook** + **Send Test Ping**, and optional Share/Paste URL.
 * **Global Tooltips Toggle & Locked Help Tips:** Switch general tooltips **All On / All Off** from Settings without ever hiding critical **Locked Info Tips** (API setup steps, Remote Order rules, and CONCORD TTK exclusions).
-* **Clickable `v2.2.0` Info Badge:** Click the version badge in the top bar or footer for release details, quick-start guidance, in-game contact (`Reccemaster`), and one-click Settings access.
+* **Clickable `v2.2.1` Info Badge:** Click the version badge in the top bar or footer for release details, quick-start guidance, in-game contact (`Reccemaster`), and one-click Settings access.
 
 ### 2. 2026 ESI Compliance & Exact Standing-Adjusted Broker Fees
-* **Unversioned ESI + Compatibility Header:** All requests target unversioned `https://esi.evetech.net/...` routes with `X-Compatibility-Date: 2026-08-18`, `User-Agent: Foxy-RedFox-Indy-Command/2.2.0 (+https://github.com/RedFoxFOMO/Foxy-RedFox-Indy-Command)`, `POST /route/{origin}/{destination}` (`Safer`, `Shorter`, `LessSecure`), and live `/status` health checks.
+* **Unversioned ESI + Compatibility Header:** All requests target unversioned `https://esi.evetech.net/...` routes with `X-Compatibility-Date: 2026-08-18`, `User-Agent: Foxy-RedFox-Indy-Command/2.2.1 (+https://github.com/RedFoxFOMO/Foxy-RedFox-Indy-Command)`, `POST /route/{origin}/{destination}` (`Safer`, `Shorter`, `LessSecure`), and live `/status` health checks.
 * **True 5-Hub NPC Standing Formula:** Automatically applies `max(1.0%, 3.0% - 0.3% × Broker Relations - 0.03% × Faction Standing - 0.02% × Corp Standing)` per Empire hub using your synced character standings.
 
 ### 3. Global Card UX, Multi-Period Trends & DOTLAN Integration

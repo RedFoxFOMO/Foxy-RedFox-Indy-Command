@@ -6,6 +6,21 @@ The format follows [Semantic Versioning](https://semver.org/):
 - **MINOR** (`1.0.0` -> `1.1.0`) for new features.
 - **PATCH** (`1.1.0` -> `1.1.1`) for fixes, refinements, and tweaks.
 
+## [2.2.1] - 2026-11-22
+
+### Fixed
+- **Card-to-Inspection Quantity Synchronization**:
+  - Wired all card quantity/runs overrides (`qtyOverridesByCardId`) bidirectionally between Opportunity Cards, the Inspection Drawer, Live Order Book depth highlights, Build Queue, and Route Optimizer state so editing quantity (`-` / `+` or manual input) on either a card or inside Inspection immediately updates both views.
+  - Derived all Inspection buy/sell depth walks, scaled material/BOM rows, build runs, depth-split Multi-Buy/Sell manifests, hauler m³/trip/jump sizing, reprocessing alternative hub yields, and net profit/ROI figures directly from `effectiveQty` (`overrideQty ?? advisedQty`).
+  - Added a clear **`Custom Qty: X (Advised: Y)`** badge with a one-click **`Reset to Advised`** button on both cards and the Inspection Drawer whenever a custom quantity override is active.
+- **Full Scrollable Order Book Depth (Removed 8-Row Cutoff)**:
+  - Removed the backend orderbook slice cap (`12` / `20`) and frontend 8-row presentation limit so thin and deep regional markets walking past row 8 can be inspected end-to-end.
+  - Rendered the full fetched Buy and Sell regional order books inside scrollable `max-h-72` containers with sticky headers, 1-indexed row numbers, full & partial fill highlighting (distinct partial-fill badge on the final consumed row), and a live **"Fill Depth Reached at Row #X"** (or shortfall) status indicator.
+
+### Documentation
+- Updated version metadata, About popover, route exports, and ESI `User-Agent` headers to **`2.2.1`**.
+- Added the **"Coming Next: v5.0.0 — 404 Industries: Flight Deck"** roadmap preview to `README.md`.
+
 ## [2.2.0] - 2026-11-21
 
 ### Added
